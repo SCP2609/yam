@@ -1378,6 +1378,25 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
         let globals = lua.globals();
         let api = lua.create_table()?;
         let permissions: HashSet<_> = manifest.permissions.iter().map(String::as_str).collect();
+        let cancelled_sleep = cancelled.clone();
+        api.set(
+            "sleep",
+            lua.create_function(move |_, ms: u64| {
+                if ms > 60_000 {
+                    return Err(mlua::Error::external("sleep is limited to 60 seconds"));
+                };
+                let mut elapsed = 0;
+                while elapsed < ms {
+                    if cancelled_sleep.load(Ordering::Relaxed) {
+                        return Err(mlua::Error::external("plugin stopped"));
+                    }
+                    let slice = (ms - elapsed).min(20);
+                    std::thread::sleep(Duration::from_millis(slice));
+                    elapsed += slice;
+                }
+                Ok(())
+            })?,
+        )?;
         if permissions.contains("led") {
             let led2 = led.clone();
             let cancelled_set = cancelled.clone();
@@ -1412,25 +1431,6 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                     tokio::runtime::Handle::current()
                         .block_on(led.play_led(pattern_root.join(name)))
                         .map_err(mlua::Error::external)
-                })?,
-            )?;
-            let cancelled_sleep = cancelled.clone();
-            api.set(
-                "sleep",
-                lua.create_function(move |_, ms: u64| {
-                    if ms > 60_000 {
-                        return Err(mlua::Error::external("sleep is limited to 60 seconds"));
-                    };
-                    let mut elapsed = 0;
-                    while elapsed < ms {
-                        if cancelled_sleep.load(Ordering::Relaxed) {
-                            return Err(mlua::Error::external("plugin stopped"));
-                        }
-                        let slice = (ms - elapsed).min(20);
-                        std::thread::sleep(Duration::from_millis(slice));
-                        elapsed += slice;
-                    }
-                    Ok(())
                 })?,
             )?;
         }

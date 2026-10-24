@@ -50,7 +50,7 @@ tar -C package-source -czf my-package.yap plugin.toml main.lua assets/
 
 | Permission | API | Требование |
 | --- | --- | --- |
-| `led` | `alice.set(colors)`, `alice.off()`, `alice.play(path)`, `alice.sleep(ms)` | RGB LED-профиль |
+| `led` | `alice.set(colors)`, `alice.off()`, `alice.play(path)` | RGB LED-профиль |
 | `volume` | `alice.volume.set(percent)`, `alice.volume.get()` | `audio.volume.alsa` |
 | `audio` | `alice.audio.play(relative_path)` | `audio.play.aplay` |
 | `bluetooth` | `alice.bluetooth.status()`, `power(bool)`, `scan(bool)`, `pair(mac)`, `connect(mac)`, `disconnect(mac)`, `remove(mac)` | `bluetooth.bluez` |
@@ -65,7 +65,7 @@ tar -C package-source -czf my-package.yap plugin.toml main.lua assets/
 | `system` | `alice.system.hostname()`, `uptime()`, `meminfo()` | нет |
 | `exec` | `alice.exec(program, args)` | runtime-настройка `allow_plugin_binaries = true` |
 
-`alice.set` принимает ровно `device.led_count` строк формата `#RRGGBB`. `alice.sleep` принимает 0–60000 мс и является точкой отмены анимации.
+`alice.set` принимает ровно `device.led_count` строк формата `#RRGGBB`. `alice.sleep(ms)` доступен любому пакету без отдельного permission, принимает 0–60000 мс и является точкой отмены.
 
 ### HTTP(S)
 
