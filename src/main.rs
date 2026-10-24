@@ -463,16 +463,19 @@ impl PluginManager {
         let stage = self.root.join(format!(".install-{}", Uuid::new_v4()));
         let budget = unpack_budget(&self.root)?;
         fs::create_dir(&stage)?;
-        let extract_result = if bytes.starts_with(b"PK\x03\x04") {
-            extract_zip_yap(bytes, &stage, budget)
+        let result = self.install_staged(bytes, &stage, budget);
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&stage);
+        }
+        result
+    }
+    fn install_staged(&self, bytes: &[u8], stage: &Path, budget: u64) -> Result<Manifest> {
+        if bytes.starts_with(b"PK\x03\x04") {
+            extract_zip_yap(bytes, stage, budget)?
         } else if bytes.starts_with(&[0x1f, 0x8b]) {
-            extract_tar_gz_yap(bytes, &stage, budget)
+            extract_tar_gz_yap(bytes, stage, budget)?
         } else {
             bail!(".yap must be a ZIP or gzip-compressed TAR archive")
-        };
-        if let Err(error) = extract_result {
-            let _ = fs::remove_dir_all(&stage);
-            return Err(error);
         }
         let manifest_text = fs::read_to_string(stage.join("plugin.toml"))
             .context(".yap must contain root plugin.toml")?;
@@ -497,7 +500,7 @@ impl PluginManager {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                for entry in walkdir::WalkDir::new(&stage) {
+                for entry in walkdir::WalkDir::new(stage) {
                     let entry = entry?;
                     if entry.file_type().is_file() {
                         let mut permissions = fs::metadata(entry.path())?.permissions();
