@@ -307,7 +307,7 @@ impl Led {
         }
         Ok(())
     }
-    async fn play_led(&self, path: PathBuf) -> Result<()> {
+    async fn play_led(&self, path: PathBuf, cancelled: &AtomicBool) -> Result<()> {
         let source = fs::read_to_string(&path)
             .with_context(|| format!("read pattern {}", path.display()))?;
         let (looped, frames) = parse_pattern(&source)?;
@@ -317,7 +317,15 @@ impl Led {
         loop {
             for f in &frames {
                 self.draw(f.colors.clone()).await?;
-                tokio::time::sleep(Duration::from_millis(f.delay_ms)).await;
+                let mut left = f.delay_ms;
+                while left > 0 {
+                    if cancelled.load(Ordering::Relaxed) {
+                        bail!("plugin stopped")
+                    }
+                    let slice = left.min(20);
+                    tokio::time::sleep(Duration::from_millis(slice)).await;
+                    left -= slice;
+                }
             }
             if !looped {
                 break;
@@ -1424,12 +1432,13 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                 })?,
             )?;
             let pattern_root = root.clone();
+            let cancelled_play = cancelled.clone();
             api.set(
                 "play",
                 lua.create_function(move |_, name: String| {
                     safe_relative(&name).map_err(mlua::Error::external)?;
                     tokio::runtime::Handle::current()
-                        .block_on(led.play_led(pattern_root.join(name)))
+                        .block_on(led.play_led(pattern_root.join(name), &cancelled_play))
                         .map_err(mlua::Error::external)
                 })?,
             )?;
