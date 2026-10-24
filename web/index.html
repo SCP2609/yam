@@ -53,12 +53,16 @@ async function request(path, options) {
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
   return response;
 }
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
 function pluginRow(plugin) {
   const { manifest, enabled, running, compatible, incompatibility } = plugin;
+  const id = escapeHtml(manifest.id);
   const run = compatible ? (running ? 'Перезапустить' : 'Запустить') : 'Несовместим';
-  const disabled = compatible ? '' : `disabled title="${incompatibility}"`;
-  const stop = running ? `<button onclick="action('${manifest.id}', 'stop')">Остановить</button>` : '';
-  return `<div class="plugin"><span><b>${manifest.name}</b> <small>${manifest.id} · ${manifest.version}<br>${manifest.description || ''}</small></span><button onclick="action('${manifest.id}', 'toggle')">${enabled ? 'Выключить' : 'Включить'}</button><button ${disabled} onclick="action('${manifest.id}', 'invoke')">${run}</button>${stop}<button onclick="action('${manifest.id}', 'delete')">Удалить</button></div>`;
+  const disabled = compatible ? '' : `disabled title="${escapeHtml(incompatibility)}"`;
+  const stop = running ? `<button onclick="action('${id}', 'stop')">Остановить</button>` : '';
+  return `<div class="plugin"><span><b>${escapeHtml(manifest.name)}</b> <small>${id} · ${escapeHtml(manifest.version)}<br>${escapeHtml(manifest.description)}</small></span><button onclick="action('${id}', 'toggle')">${enabled ? 'Выключить' : 'Включить'}</button><button ${disabled} onclick="action('${id}', 'invoke')">${run}</button>${stop}<button onclick="action('${id}', 'delete')">Удалить</button></div>`;
 }
 async function load() {
   try {
