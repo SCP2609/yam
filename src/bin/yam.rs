@@ -151,6 +151,11 @@ fn main() -> Result<()> {
         Command::Enable { id } => set_enabled(&client, &cli.url, &id, true)?,
         Command::Disable { id } => set_enabled(&client, &cli.url, &id, false)?,
         Command::Run { id, detach, args } => {
+            let log_offset = if detach {
+                0
+            } else {
+                package_logs(&client, &cli.url, &id)?.len()
+            };
             print_response(
                 client
                     .post(endpoint(&cli.url, &format!("/api/plugins/{id}/invoke")))
@@ -159,6 +164,8 @@ fn main() -> Result<()> {
             )?;
             if !detach {
                 wait_for_package(&client, &cli.url, &id)?;
+                let log = package_logs(&client, &cli.url, &id)?;
+                print!("{}", log.get(log_offset..).unwrap_or(&log));
             }
         }
         Command::Stop { id } => print_response(
@@ -445,4 +452,12 @@ fn wait_for_package(client: &Client, url: &str, id: &str) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+fn package_logs(client: &Client, url: &str, id: &str) -> Result<String> {
+    Ok(client
+        .get(endpoint(url, &format!("/api/plugins/{id}/logs")))
+        .send()?
+        .error_for_status()?
+        .text()?)
 }
