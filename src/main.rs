@@ -2088,10 +2088,20 @@ async fn stop_plugin(
     State(a): State<App>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    if let Some(token) = a.plugins.lock().await.running.remove(&id) {
-        token.store(true, Ordering::Relaxed);
+    let mut plugins = a.plugins.lock().await;
+    let Some(token) = plugins.running.remove(&id) else {
+        return Ok(StatusCode::NO_CONTENT);
+    };
+    token.store(true, Ordering::Relaxed);
+    let uses_led = plugins
+        .manifest(&id)?
+        .permissions
+        .iter()
+        .any(|p| p == "led");
+    drop(plugins);
+    if uses_led {
+        let _ = a.led.off().await;
     }
-    let _ = a.led.off().await;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn package_logs(
