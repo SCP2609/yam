@@ -1437,7 +1437,9 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                         .arg("-q")
                         .arg(path)
                         .spawn()
-                        .map(|_| ())
+                        .map(|mut child| {
+                            std::thread::spawn(move || child.wait());
+                        })
                         .map_err(mlua::Error::external)
                 })?,
             )?;
