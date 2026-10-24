@@ -1887,6 +1887,11 @@ async fn start_package(app: App, id: String, invocation_args: Vec<String>) -> Re
             bail!("package is disabled")
         }
         let manifest = plugins.manifest(&id)?;
+        if manifest.launch.kind == LaunchKind::Binary
+            && !app.settings.lock().await.allow_plugin_binaries
+        {
+            bail!("binary execution disabled by administrator")
+        }
         if !invocation_args.is_empty() {
             if manifest.launch.kind != LaunchKind::Binary {
                 bail!("only binary packages accept invocation arguments")
