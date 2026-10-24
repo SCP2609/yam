@@ -549,8 +549,18 @@ fn set_archive_mode(path: &Path, mode: u32) -> Result<()> {
     }
     Ok(())
 }
+const MAX_UNPACKED_BYTES: u64 = 32 * 1024 * 1024;
+fn copy_limited(source: impl Read, output: &mut fs::File, remaining: &mut u64) -> Result<()> {
+    let written = std::io::copy(&mut source.take(*remaining + 1), output)?;
+    if written > *remaining {
+        bail!("package unpacks to more than 32 MiB")
+    }
+    *remaining -= written;
+    Ok(())
+}
 fn extract_zip_yap(bytes: &[u8], stage: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+    let mut remaining = MAX_UNPACKED_BYTES;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let path = entry
@@ -566,7 +576,7 @@ fn extract_zip_yap(bytes: &[u8], stage: &Path) -> Result<()> {
             }
             let mode = entry.unix_mode();
             let mut output = fs::File::create(&destination)?;
-            std::io::copy(&mut entry, &mut output)?;
+            copy_limited(&mut entry, &mut output, &mut remaining)?;
             if let Some(mode) = mode {
                 set_archive_mode(&destination, mode)?;
             }
@@ -577,6 +587,7 @@ fn extract_zip_yap(bytes: &[u8], stage: &Path) -> Result<()> {
 fn extract_tar_gz_yap(bytes: &[u8], stage: &Path) -> Result<()> {
     let decoder = GzDecoder::new(Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
+    let mut remaining = MAX_UNPACKED_BYTES;
     for item in archive.entries()? {
         let mut entry = item?;
         let path = archive_path(&entry.path()?)?;
@@ -590,7 +601,7 @@ fn extract_tar_gz_yap(bytes: &[u8], stage: &Path) -> Result<()> {
             }
             let mode = entry.header().mode()?;
             let mut output = fs::File::create(&destination)?;
-            std::io::copy(&mut entry, &mut output)?;
+            copy_limited(&mut entry, &mut output, &mut remaining)?;
             set_archive_mode(&destination, mode)?;
         } else {
             bail!("unsupported TAR archive entry")
