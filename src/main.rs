@@ -2382,6 +2382,13 @@ fn stage_release_update(executable: &Path, data_dir: &Path, listen: &str) -> Res
             }
         })
         .context("release SHA256SUMS has no yamd checksum")?;
+    if format!(
+        "{:x}",
+        Sha256::digest(fs::read(executable).unwrap_or_default())
+    ) == expected
+    {
+        return Ok(false);
+    }
     let binary = client
         .get(format!("{RELEASES}/yamd-aarch64-linux-musl"))
         .header("User-Agent", "yam-auto-updater")
@@ -2391,9 +2398,6 @@ fn stage_release_update(executable: &Path, data_dir: &Path, listen: &str) -> Res
         .to_vec();
     if format!("{:x}", Sha256::digest(&binary)) != expected {
         bail!("release checksum mismatch")
-    }
-    if binary == fs::read(executable).unwrap_or_default() {
-        return Ok(false);
     }
     let staged = executable.with_extension("yam-update");
     fs::write(&staged, binary)?;
