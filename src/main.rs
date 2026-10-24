@@ -2056,6 +2056,9 @@ async fn toggle(
     let enabled = p.enabled.insert(id.clone());
     if !enabled {
         p.enabled.remove(&id);
+        if let Some(token) = p.running.remove(&id) {
+            token.store(true, Ordering::Relaxed);
+        }
     }
     p.save()?;
     drop(p);
