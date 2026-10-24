@@ -461,11 +461,12 @@ impl PluginManager {
     }
     fn install(&mut self, bytes: &[u8]) -> Result<Manifest> {
         let stage = self.root.join(format!(".install-{}", Uuid::new_v4()));
+        let budget = unpack_budget(&self.root)?;
         fs::create_dir(&stage)?;
         let extract_result = if bytes.starts_with(b"PK\x03\x04") {
-            extract_zip_yap(bytes, &stage)
+            extract_zip_yap(bytes, &stage, budget)
         } else if bytes.starts_with(&[0x1f, 0x8b]) {
-            extract_tar_gz_yap(bytes, &stage)
+            extract_tar_gz_yap(bytes, &stage, budget)
         } else {
             bail!(".yap must be a ZIP or gzip-compressed TAR archive")
         };
@@ -550,17 +551,36 @@ fn set_archive_mode(path: &Path, mode: u32) -> Result<()> {
     Ok(())
 }
 const MAX_UNPACKED_BYTES: u64 = 32 * 1024 * 1024;
+const FREE_SPACE_RESERVE: u64 = 8 * 1024 * 1024;
+fn unpack_budget(directory: &Path) -> Result<u64> {
+    Ok(MAX_UNPACKED_BYTES.min(available_bytes(directory)?.saturating_sub(FREE_SPACE_RESERVE)))
+}
+#[cfg(unix)]
+fn available_bytes(directory: &Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(directory.as_os_str().as_bytes())?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("statvfs {}", directory.display()));
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_bavail as u64 * stat.f_frsize as u64)
+}
+#[cfg(not(unix))]
+fn available_bytes(_: &Path) -> Result<u64> {
+    Ok(u64::MAX)
+}
 fn copy_limited(source: impl Read, output: &mut fs::File, remaining: &mut u64) -> Result<()> {
     let written = std::io::copy(&mut source.take(*remaining + 1), output)?;
     if written > *remaining {
-        bail!("package unpacks to more than 32 MiB")
+        bail!("package does not fit: unpacked size is limited to 32 MiB and 8 MiB of free space is kept")
     }
     *remaining -= written;
     Ok(())
 }
-fn extract_zip_yap(bytes: &[u8], stage: &Path) -> Result<()> {
+fn extract_zip_yap(bytes: &[u8], stage: &Path, mut remaining: u64) -> Result<()> {
     let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
-    let mut remaining = MAX_UNPACKED_BYTES;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let path = entry
@@ -584,10 +604,9 @@ fn extract_zip_yap(bytes: &[u8], stage: &Path) -> Result<()> {
     }
     Ok(())
 }
-fn extract_tar_gz_yap(bytes: &[u8], stage: &Path) -> Result<()> {
+fn extract_tar_gz_yap(bytes: &[u8], stage: &Path, mut remaining: u64) -> Result<()> {
     let decoder = GzDecoder::new(Cursor::new(bytes));
     let mut archive = tar::Archive::new(decoder);
-    let mut remaining = MAX_UNPACKED_BYTES;
     for item in archive.entries()? {
         let mut entry = item?;
         let path = archive_path(&entry.path()?)?;
