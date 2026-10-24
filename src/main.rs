@@ -2437,9 +2437,9 @@ fn runtime_api_url(listen: &str) -> Result<String> {
 }
 fn start_auto_updater(app: App, executable: PathBuf, listen: String) {
     task::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(60)).await;
         loop {
-            let updates = app.settings.lock().await.updates.clone();
-            if updates.enabled {
+            if app.settings.lock().await.updates.enabled {
                 let executable = executable.clone();
                 let data_dir = app.root.clone();
                 let listen = listen.clone();
@@ -2458,10 +2458,8 @@ fn start_auto_updater(app: App, executable: PathBuf, listen: String) {
                     Err(error) => tracing::warn!(%error, "automatic update task failed"),
                 }
             }
-            tokio::time::sleep(Duration::from_secs(
-                updates.interval_minutes.clamp(5, 24 * 60) * 60,
-            ))
-            .await;
+            let interval = app.settings.lock().await.updates.interval_minutes;
+            tokio::time::sleep(Duration::from_secs(interval.clamp(5, 24 * 60) * 60)).await;
         }
     });
 }
