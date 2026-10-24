@@ -43,6 +43,8 @@
   <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script>
 const api = '/api';
+const terminalDialog = document.getElementById('terminal-dialog');
+const terminalElement = document.getElementById('terminal');
 async function request(path, options) {
   const response = await fetch(api + path, options);
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
@@ -81,9 +83,9 @@ upload.onsubmit = async event => {
 let terminalSocket, terminalInstance;
 function openTerminal(id) {
   terminalDialog.showModal();
-  terminal.innerHTML = '';
+  terminalElement.innerHTML = '';
   terminalInstance = new Terminal({ cursorBlink: true, theme: { background: '#10131a' } });
-  terminalInstance.open(terminal);
+  terminalInstance.open(terminalElement);
   const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
   terminalSocket = new WebSocket(`${scheme}://${location.host}${api}/plugins/${encodeURIComponent(id)}/terminal`);
   terminalSocket.binaryType = 'arraybuffer';
