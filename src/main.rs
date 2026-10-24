@@ -1,9 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use axum::{
-    extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Multipart, Path as AxumPath, State,
-    },
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State},
     http::{HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{delete, get, post},
@@ -11,15 +8,13 @@ use axum::{
 };
 use clap::Parser;
 use flate2::read::GzDecoder;
-use futures_util::{SinkExt, StreamExt};
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{Cursor, Read, Write},
+    io::{Cursor, Read},
     net::TcpStream,
     path::{Component, Path, PathBuf},
     process::Command,
@@ -29,11 +24,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::{
-    net::TcpListener,
-    sync::{mpsc, Mutex},
-    task,
-};
+use tokio::{net::TcpListener, sync::Mutex, task};
 use tower_http::trace::TraceLayer;
 use url::Url;
 use uuid::Uuid;
@@ -2144,123 +2135,6 @@ async fn package_logs(
     let path = a.plugins.lock().await.root.join(id).join("runtime.log");
     Ok(fs::read_to_string(path).unwrap_or_default())
 }
-async fn terminal(
-    State(a): State<App>,
-    AxumPath(id): AxumPath<String>,
-    websocket: WebSocketUpgrade,
-) -> Result<impl IntoResponse, ApiError> {
-    validate_id(&id)?;
-    if !a.settings.lock().await.allow_plugin_binaries {
-        return Err(ApiError(anyhow!(
-            "binary execution disabled by administrator"
-        )));
-    }
-    let (manifest, root) = {
-        let plugins = a.plugins.lock().await;
-        if !plugins.enabled.contains(&id) {
-            return Err(ApiError(anyhow!("package is disabled")));
-        }
-        let manifest = plugins.manifest(&id)?;
-        if manifest.launch.kind != LaunchKind::Binary || manifest.launch.mode != LaunchMode::Oneshot
-        {
-            return Err(ApiError(anyhow!(
-                "terminal is available only for binary oneshot packages"
-            )));
-        }
-        (manifest, plugins.root.join(&id))
-    };
-    let executable = manifest.launch.path(&manifest).to_owned();
-    safe_relative(&executable)?;
-    let token = Uuid::new_v4().to_string();
-    a.runtime_tokens
-        .lock()
-        .await
-        .insert(id.clone(), token.clone());
-    let api_url = format!("{}/api/runtime/{id}", a.runtime_api_url);
-    Ok(websocket.on_upgrade(move |socket| {
-        terminal_session(
-            socket,
-            root,
-            executable,
-            manifest.launch.args,
-            a,
-            id,
-            token,
-            api_url,
-        )
-    }))
-}
-
-async fn terminal_session(
-    socket: WebSocket,
-    root: PathBuf,
-    executable: String,
-    args: Vec<String>,
-    app: App,
-    id: String,
-    token: String,
-    api_url: String,
-) {
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (output_tx, mut output_rx) = mpsc::channel::<Vec<u8>>(32);
-    let task_id = id.clone();
-    let worker = task::spawn_blocking(move || -> Result<()> {
-        let pair = native_pty_system().openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        let mut command = CommandBuilder::new(root.join(&executable));
-        command.cwd(&root);
-        command.args(args);
-        command.env("LD_LIBRARY_PATH", binary_library_path(&root, &executable));
-        command.env("YAM_API_URL", api_url);
-        command.env("YAM_API_TOKEN", token);
-        command.env("YAM_PLUGIN_ID", task_id);
-        let mut child = pair.slave.spawn_command(command)?;
-        let mut reader = pair.master.try_clone_reader()?;
-        let mut writer = pair.master.take_writer()?;
-        let reader_output = output_tx.clone();
-        std::thread::spawn(move || {
-            let mut buffer = [0_u8; 4096];
-            while let Ok(size) = reader.read(&mut buffer) {
-                if size == 0
-                    || reader_output
-                        .blocking_send(buffer[..size].to_vec())
-                        .is_err()
-                {
-                    break;
-                }
-            }
-        });
-        while let Ok(data) = input_rx.recv() {
-            writer.write_all(&data)?;
-            writer.flush()?;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-        Ok(())
-    });
-    let (mut sender, mut receiver) = socket.split();
-    loop {
-        tokio::select! {
-            output = output_rx.recv() => match output {
-                Some(data) => if sender.send(Message::Binary(data.into())).await.is_err() { break; },
-                None => break,
-            },
-            incoming = receiver.next() => match incoming {
-                Some(Ok(Message::Text(data))) => { let _ = input_tx.send(data.as_bytes().to_vec()); },
-                Some(Ok(Message::Binary(data))) => { let _ = input_tx.send(data.to_vec()); },
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                _ => {},
-            }
-        }
-    }
-    drop(input_tx);
-    let _ = worker.await;
-    app.runtime_tokens.lock().await.remove(&id);
-}
 async fn runtime_permission(
     app: &App,
     id: &str,
@@ -2596,7 +2470,6 @@ async fn main() -> Result<()> {
             .route("/api/plugins/:id/invoke", post(invoke))
             .route("/api/plugins/:id/stop", post(stop_plugin))
             .route("/api/plugins/:id/logs", get(package_logs))
-            .route("/api/plugins/:id/terminal", get(terminal))
             .route("/api/runtime/:id/device", get(runtime_device))
             .route("/api/runtime/:id/sensors", get(runtime_sensors))
             .route("/api/runtime/:id/led", post(runtime_led))
