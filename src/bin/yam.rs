@@ -281,34 +281,55 @@ fn open_tui(client: &Client, url: &str, id: &str, args: &[String]) -> Result<()>
         .collect::<Vec<_>>();
     command_args.extend(args.iter().cloned());
     let serial = adb_station()?;
-    let root = format!("/data/quazar/yam/data/plugins/{id}");
-    let library = std::path::Path::new(path)
-        .parent()
-        .and_then(std::path::Path::parent)
-        .map(|directory| format!("{root}/{}", directory.display()));
-    let library_setup = library
-        .map(|directory| {
-            format!(
-                "export LD_LIBRARY_PATH={}:\"${{LD_LIBRARY_PATH:-}}\" && ",
-                shell_quote(&format!("{directory}/lib"))
-            )
-        })
-        .unwrap_or_default();
-    let legacy_runner = format!("./{id}/{id}-run");
+    // Older daemons do not report the package directory.
+    let root = package["directory"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("/data/quazar/yam/data/plugins/{id}"));
+    // Mirrors `launch_program` / `binary_library_path` in yamd.
+    let interpreter = launch["interpreter"].as_str();
+    let explicit_libraries = launch["library_paths"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(|directory| format!("{root}/{directory}"))
+        .collect::<Vec<_>>();
+    let libraries = if explicit_libraries.is_empty() {
+        std::path::Path::new(path)
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(|directory| format!("{root}/{}/lib", directory.display()))
+            .into_iter()
+            .collect()
+    } else {
+        explicit_libraries
+    };
+    let library_setup = if libraries.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "export LD_LIBRARY_PATH={}:\"${{LD_LIBRARY_PATH:-}}\" && ",
+            shell_quote(&libraries.join(":"))
+        )
+    };
     let rendered_args = command_args
         .iter()
         .map(|arg| format!(" {}", shell_quote(arg)))
         .collect::<String>();
-    let remote = format!(
-        "cd {} && find . -type f -exec chmod 755 {{}} \\; && if [ -f {} ]; then exec sh {}{}; fi; {}exec {}{}",
-        shell_quote(&root),
-        shell_quote(&legacy_runner),
-        shell_quote(&legacy_runner),
-        rendered_args,
-        library_setup,
-        shell_quote(&format!("./{path}")),
-        rendered_args,
-    );
+    let program = shell_quote(&format!("./{path}"));
+    let launch_command = match interpreter {
+        Some("sh") => format!("{library_setup}exec sh {program}{rendered_args}"),
+        Some(other) => bail!("unsupported launch interpreter {other}"),
+        None => {
+            let legacy_runner = shell_quote(&format!("./{id}/{id}-run"));
+            format!(
+                "if [ -f {legacy_runner} ]; then exec sh {legacy_runner}{rendered_args}; fi; \
+                 {library_setup}exec {program}{rendered_args}"
+            )
+        }
+    };
+    let remote = format!("cd {} && {launch_command}", shell_quote(&root));
     let status = ProcessCommand::new("adb")
         .args(["-s", &serial, "shell", "-t", &remote])
         .status()

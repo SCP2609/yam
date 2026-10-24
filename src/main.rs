@@ -104,8 +104,9 @@ fn default_led_root() -> String {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            // Unknown hardware gets the `custom` template; `main` swaps in a detected profile.
             led: LedSettings {
-                profile: "mini2".into(),
+                profile: "custom".into(),
                 count: 6,
                 sysfs_root: default_led_root(),
                 path_template: None,
@@ -154,6 +155,12 @@ struct Launch {
     path: String,
     #[serde(default)]
     args: Vec<String>,
+    /// Runs `path` through this interpreter; only `sh` is accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interpreter: Option<String>,
+    /// Package-relative directories prepended to `LD_LIBRARY_PATH`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    library_paths: Vec<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -225,6 +232,8 @@ struct ClockRequest {
 #[derive(Debug, Clone, Serialize)]
 struct PluginInfo {
     manifest: Manifest,
+    /// Absolute package directory on the speaker, used by `yam tui`.
+    directory: PathBuf,
     enabled: bool,
     running: bool,
     compatible: bool,
@@ -281,40 +290,19 @@ impl Led {
         self.draw(vec!["#000000".into(); c.count]).await
     }
     async fn write(&self, c: &LedSettings, channel: &str, i: usize, value: u8) -> Result<()> {
-        let path = match c.profile.as_str() {
-            "midi" => {
-                PathBuf::from(&c.sysfs_root).join(format!("cucumber:{channel}:ring{i}/brightness"))
-            }
-            "mini2" => PathBuf::from(&c.sysfs_root)
-                .join(format!("mini2:{channel}:ring{}/brightness", i + 1)),
-            "micro" => PathBuf::from(&c.sysfs_root)
-                .join(format!("micro:{channel}:ring{}/brightness", i + 1)),
-            "plum" => PathBuf::from(&c.sysfs_root)
-                .join(format!("plum:{channel}:ring{}/brightness", i + 1)),
-            "sysfs-ring" => {
-                PathBuf::from(&c.sysfs_root).join(format!("{channel}:ring{}/brightness", i + 1))
-            }
-            "custom" => PathBuf::from(
-                c.path_template
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("custom profile needs path_template"))?
-                    .replace("{root}", &c.sysfs_root)
-                    .replace("{channel}", channel)
-                    .replace("{index}", &(i + 1).to_string()),
-            ),
-            p => bail!("unknown LED profile {p}"),
-        };
+        let path = led_brightness_path(c, channel, i)?;
         fs::write(&path, value.to_string()).with_context(|| format!("write {}", path.display()))
     }
     // Writing brightness detaches the `ledfb-ring` trigger used by platformd.
     fn release_midi(&self, c: &LedSettings) -> Result<()> {
         for i in 0..c.count {
             for channel in ["red", "green", "blue"] {
-                let led = PathBuf::from(&c.sysfs_root).join(format!("cucumber:{channel}:ring{i}"));
-                fs::write(led.join("brightness"), "0")
-                    .with_context(|| format!("write {}", led.display()))?;
-                fs::write(led.join("trigger"), "ledfb-ring")
-                    .with_context(|| format!("restore trigger {}", led.display()))?;
+                let brightness = led_brightness_path(c, channel, i)?;
+                fs::write(&brightness, "0")
+                    .with_context(|| format!("write {}", brightness.display()))?;
+                let trigger = brightness.with_file_name("trigger");
+                fs::write(&trigger, "ledfb-ring")
+                    .with_context(|| format!("restore trigger {}", trigger.display()))?;
             }
         }
         Ok(())
@@ -338,9 +326,46 @@ impl Led {
         Ok(())
     }
 }
+/// Known sysfs ring layouts: (profile, LED name prefix, first index, LED count).
+const LED_PROFILES: [(&str, &str, usize, usize); 4] = [
+    ("micro", "micro:", 1, 3),
+    ("midi", "cucumber:", 0, 24),
+    ("plum", "plum:", 1, 3),
+    ("mini2", "mini2:", 1, 6),
+];
+/// `index` is zero-based; profiles number their sysfs LEDs from their own base.
+fn led_brightness_path(c: &LedSettings, channel: &str, index: usize) -> Result<PathBuf> {
+    let root = PathBuf::from(&c.sysfs_root);
+    if let Some((_, prefix, base, _)) = LED_PROFILES.iter().find(|p| p.0 == c.profile) {
+        return Ok(root.join(format!("{prefix}{channel}:ring{}/brightness", index + base)));
+    }
+    match c.profile.as_str() {
+        "sysfs-ring" => Ok(root.join(format!("{channel}:ring{}/brightness", index + 1))),
+        "custom" => Ok(PathBuf::from(
+            c.path_template
+                .as_ref()
+                .context("custom profile needs path_template")?
+                .replace("{root}", &c.sysfs_root)
+                .replace("{channel}", channel)
+                .replace("{index}", &(index + 1).to_string()),
+        )),
+        p => bail!("unknown LED profile {p}"),
+    }
+}
+/// Picks the first known ring layout present in sysfs.
+fn detect_led_profile(sysfs_root: &str) -> Option<(&'static str, usize)> {
+    LED_PROFILES
+        .iter()
+        .find(|(_, prefix, base, _)| {
+            Path::new(sysfs_root)
+                .join(format!("{prefix}red:ring{base}/brightness"))
+                .exists()
+        })
+        .map(|(profile, _, _, count)| (*profile, *count))
+}
 fn parse_color(s: &str) -> Result<(u8, u8, u8)> {
     let h = s.trim().trim_start_matches('#');
-    if h.len() != 6 {
+    if h.len() != 6 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid RGB color {s}")
     };
     Ok((
@@ -385,10 +410,13 @@ struct PluginManager {
 impl PluginManager {
     fn new(root: PathBuf) -> Result<Self> {
         fs::create_dir_all(&root)?;
-        let enabled = fs::read_to_string(root.join("enabled.json"))
-            .ok()
-            .and_then(|v| serde_json::from_str(&v).ok())
-            .unwrap_or_default();
+        let enabled = match fs::read_to_string(root.join("enabled.json")) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
+                tracing::warn!(%error, "enabled.json is corrupt; all packages start disabled");
+                HashSet::new()
+            }),
+            Err(_) => HashSet::new(),
+        };
         Ok(Self {
             root,
             enabled,
@@ -396,11 +424,10 @@ impl PluginManager {
         })
     }
     fn save(&self) -> Result<()> {
-        fs::write(
-            self.root.join("enabled.json"),
-            serde_json::to_vec_pretty(&self.enabled)?,
-        )?;
-        Ok(())
+        write_atomic(
+            &self.root.join("enabled.json"),
+            &serde_json::to_vec_pretty(&self.enabled)?,
+        )
     }
     fn list(&self, device: &DeviceProfile) -> Result<Vec<PluginInfo>> {
         let mut out = vec![];
@@ -414,6 +441,7 @@ impl PluginManager {
                 if let Ok(manifest) = toml::from_str::<Manifest>(&x) {
                     let reason = compatibility_error(&manifest, device);
                     out.push(PluginInfo {
+                        directory: e.path(),
                         enabled: self.enabled.contains(&manifest.id),
                         running: self.running.contains_key(&manifest.id),
                         compatible: reason.is_none(),
@@ -451,6 +479,12 @@ impl PluginManager {
         validate_id(&m.id)?;
         safe_relative(&m.entry)?;
         safe_relative(m.launch.path(&m))?;
+        for directory in &m.launch.library_paths {
+            safe_relative(directory)?;
+        }
+        if m.launch.interpreter.as_deref().is_some_and(|x| x != "sh") {
+            bail!("launch.interpreter supports only \"sh\"")
+        }
         if m.launch.kind == LaunchKind::Binary && !m.permissions.iter().any(|p| p == "exec") {
             bail!("binary packages require the exec permission")
         }
@@ -600,44 +634,36 @@ fn detect_device(root: &Path, forced: Option<String>) -> DeviceProfile {
     .collect::<Vec<_>>()
     .join(" ")
     .to_lowercase();
-    let mut model = forced.unwrap_or_else(|| {
-        if Path::new("/sys/class/leds/micro:red:ring1/brightness").exists()
-            || text.contains("yandexmicro")
-        {
-            "yandexmicro".into()
-        } else if Path::new("/sys/class/leds/cucumber:red:ring0/brightness").exists()
-            || text.contains("yandex,cucumber")
-        {
-            "yandexmidi".into()
-        } else if Path::new("/sys/class/leds/plum:red:ring1/brightness").exists()
-            || text.contains("yandex,plum")
-        {
-            "yandexplum".into()
-        } else if Path::new("/sys/class/leds/mini2:red:ring1/brightness").exists()
-            || text.contains("yandexmini_2")
-        {
-            "yandexmini_2".into()
-        } else if text.contains("yandexstation_2") {
-            "yandexstation_2".into()
-        } else if text.contains("yandexmini") {
-            "yandexmini".into()
-        } else if text.contains("yandexmicro") {
-            "yandexmicro".into()
-        } else {
-            "unknown".into()
-        }
+    // Ring layout is the most reliable signal; device-tree strings cover the rest.
+    // Mini 2 reports `yandex,station-mini2` in its device-tree compatible list.
+    const TEXT_MODELS: [(&str, &str); 7] = [
+        ("yandexmicro", "yandexmicro"),
+        ("yandex,cucumber", "yandexmidi"),
+        ("yandex,plum", "yandexplum"),
+        ("yandexmini_2", "yandexmini_2"),
+        ("station-mini2", "yandexmini_2"),
+        ("yandexstation_2", "yandexstation_2"),
+        ("yandexmini", "yandexmini"),
+    ];
+    let model = forced.unwrap_or_else(|| {
+        let by_leds = detect_led_profile(&default_led_root()).map(|(profile, _)| match profile {
+            "micro" => "yandexmicro",
+            "midi" => "yandexmidi",
+            "plum" => "yandexplum",
+            _ => "yandexmini_2",
+        });
+        by_leds
+            .or_else(|| {
+                TEXT_MODELS
+                    .iter()
+                    .find(|(needle, _)| text.contains(needle))
+                    .map(|(_, model)| *model)
+            })
+            .unwrap_or("unknown")
+            .into()
     });
+    // LED ring features depend on the configured profile and are added in `main`.
     let mut features = vec!["runtime.lua.v1".into(), "plugin.yap.v1".into()];
-    if Path::new("/sys/class/leds/mini2:red:ring1/brightness").exists() {
-        features.extend([
-            "led.ring.rgb".into(),
-            "led.ring.6".into(),
-            "led.pattern.v1".into(),
-        ])
-    };
-    if Path::new("/sys/class/leds").exists() && !features.iter().any(|x| x == "led.ring.rgb") {
-        features.push("led.sysfs".into())
-    };
     if command_exists("amixer") {
         features.push("audio.volume.alsa".into())
     }
@@ -676,15 +702,22 @@ fn detect_device(root: &Path, forced: Option<String>) -> DeviceProfile {
     if arch == "aarch64" {
         features.push("arch.aarch64".into())
     }
-    if model == "unknown" {
-        model = "unknown".into()
-    };
     DeviceProfile {
         model,
         architecture: arch,
         features,
         source: "auto (override: data-dir/device.toml or --model)".into(),
     }
+}
+/// Replaces `path` via a synced sibling file so a power cut never leaves it truncated.
+fn write_atomic(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let temporary = path.with_extension("tmp");
+    let mut file =
+        fs::File::create(&temporary).with_context(|| format!("write {}", temporary.display()))?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    fs::rename(&temporary, path).with_context(|| format!("replace {}", path.display()))
 }
 fn read_trimmed(path: &Path) -> Result<String> {
     Ok(fs::read_to_string(path)?.trim().to_string())
@@ -860,7 +893,12 @@ impl ClockLayout {
         Ok(())
     }
 }
-fn clock_layout() -> Option<ClockLayout> {
+// The LED set is fixed by the kernel driver, so the layout is probed once.
+fn clock_layout() -> Option<&'static ClockLayout> {
+    static LAYOUT: std::sync::OnceLock<Option<ClockLayout>> = std::sync::OnceLock::new();
+    LAYOUT.get_or_init(probe_clock_layout).as_ref()
+}
+fn probe_clock_layout() -> Option<ClockLayout> {
     let names = fs::read_dir("/sys/class/leds")
         .ok()?
         .flatten()
@@ -886,8 +924,8 @@ fn clock_layout() -> Option<ClockLayout> {
 }
 fn clock_segments() -> Vec<String> {
     clock_layout()
-        .unwrap_or(ClockLayout::Mini2(String::new()))
-        .segments()
+        .map(ClockLayout::segments)
+        .unwrap_or_default()
 }
 fn clock_available() -> bool {
     clock_layout().is_some()
@@ -1178,80 +1216,6 @@ fn ipc_next(service: &str, timeout_ms: u64) -> Result<Option<serde_json::Value>>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decodes_recognized_phrase() {
-        // QuasarMessage.alice_state (3), AliceState.recognized_phrase (2) = "hi".
-        let message = [0x1a, 0x04, 0x12, 0x02, b'h', b'i'];
-        let event = decode_ipc_event("aliced", &message).unwrap().unwrap();
-        assert_eq!(event["transcript"], "hi");
-    }
-
-    #[test]
-    fn decodes_fired_alarm() {
-        // QuasarMessage.alarm_event (215), AlarmEvent.alarm_fired (1), Alarm{id:"a1", type:TIMER}.
-        let message = [
-            0xba, 0x0d, 0x08, 0x0a, 0x06, 0x0a, 0x02, b'a', b'1', 0x10, 0x02,
-        ];
-        let event = decode_ipc_event("alarmd", &message).unwrap().unwrap();
-        assert_eq!(event["id"], "a1");
-        assert_eq!(event["alarm_type"], 2);
-    }
-
-    #[test]
-    fn maps_cucumber_clock_segments() {
-        let layout = ClockLayout::Cucumber("cucumber:".into());
-        assert_eq!(layout.segments().len(), 45);
-        assert_eq!(
-            layout.path("PLUS1"),
-            Path::new("/sys/class/leds/cucumber:white:clock-p3/brightness")
-        );
-        assert_eq!(
-            layout.path("G4"),
-            Path::new("/sys/class/leds/cucumber:white:clock-g4/brightness")
-        );
-    }
-
-    #[test]
-    fn maps_plum_clock_segments() {
-        let layout = ClockLayout::Plum("plum:white:".into());
-        // 8 parts x 4 positions + DEGREE + DH + DM + DL.
-        assert_eq!(layout.segments().len(), 36);
-        assert!(layout.segments().contains(&"A0".to_string()));
-        assert!(layout.segments().contains(&"H3".to_string()));
-        assert!(layout.segments().contains(&"DH".to_string()));
-        assert!(!layout.segments().contains(&"PLUS1".to_string()));
-        assert_eq!(
-            layout.path("A0"),
-            Path::new("/sys/class/leds/plum:white:clockA0/brightness")
-        );
-        assert_eq!(
-            layout.path("DL"),
-            Path::new("/sys/class/leds/plum:white:clockDL/brightness")
-        );
-    }
-
-    #[test]
-    fn network_policy_rejects_local_address() {
-        let policy = NetworkPolicy {
-            allow: vec!["127.0.0.1".into()],
-            allow_insecure_http: true,
-        };
-        assert!(network_url_allowed(&policy, "http://127.0.0.1/").is_err());
-    }
-
-    #[test]
-    fn network_wildcard_allows_public_host() {
-        let policy = NetworkPolicy {
-            allow: vec!["*".into()],
-            allow_insecure_http: false,
-        };
-        assert!(network_url_allowed(&policy, "https://api.example.org/path").is_ok());
-    }
-}
 fn clock_time(value: &str, brightness: u8) -> Result<()> {
     let bytes = value.as_bytes();
     if bytes.len() != 5
@@ -1288,7 +1252,7 @@ fn clock_time(value: &str, brightness: u8) -> Result<()> {
             segments.insert(format!("{part}{}", index + base), brightness);
         }
     }
-    match &layout {
+    match layout {
         ClockLayout::Plum(_) => {
             segments.insert("DH".into(), brightness);
             segments.insert("DL".into(), brightness);
@@ -1346,40 +1310,9 @@ fn valid_mac(mac: &str) -> bool {
         })
 }
 fn configured_rgb_ring(settings: &LedSettings) -> bool {
-    let sample = |channel: &str| -> Option<PathBuf> {
-        match settings.profile.as_str() {
-            "midi" => Some(
-                PathBuf::from(&settings.sysfs_root)
-                    .join(format!("cucumber:{channel}:ring0/brightness")),
-            ),
-            "mini2" => Some(
-                PathBuf::from(&settings.sysfs_root)
-                    .join(format!("mini2:{channel}:ring1/brightness")),
-            ),
-            "micro" => Some(
-                PathBuf::from(&settings.sysfs_root)
-                    .join(format!("micro:{channel}:ring1/brightness")),
-            ),
-            "plum" => Some(
-                PathBuf::from(&settings.sysfs_root)
-                    .join(format!("plum:{channel}:ring1/brightness")),
-            ),
-            "sysfs-ring" => Some(
-                PathBuf::from(&settings.sysfs_root).join(format!("{channel}:ring1/brightness")),
-            ),
-            "custom" => settings.path_template.as_ref().map(|t| {
-                PathBuf::from(
-                    t.replace("{root}", &settings.sysfs_root)
-                        .replace("{channel}", channel)
-                        .replace("{index}", "1"),
-                )
-            }),
-            _ => None,
-        }
-    };
     ["red", "green", "blue"]
         .iter()
-        .all(|channel| sample(channel).is_some_and(|p| p.exists()))
+        .all(|channel| led_brightness_path(settings, channel, 0).is_ok_and(|p| p.exists()))
 }
 
 async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBool>) -> Result<()> {
@@ -1851,22 +1784,20 @@ async fn run_binary(
             .create(true)
             .append(true)
             .open(log_path)?;
-        let legacy_runner = root.join(&manifest.id).join(format!("{}-run", manifest.id));
-        let mut command = if legacy_runner.is_file() {
-            let mut command = Command::new("sh");
-            command.arg(legacy_runner);
-            command
-        } else {
-            Command::new(root.join(executable))
+        let (interpreter, program) = launch_program(&manifest, &root, &executable);
+        let mut command = match interpreter {
+            Some(interpreter) => {
+                let mut command = Command::new(interpreter);
+                command.arg(program);
+                command
+            }
+            None => Command::new(program),
         };
         let mut child = command
             .args(&manifest.launch.args)
             .args(invocation_args)
             .current_dir(&root)
-            .env(
-                "LD_LIBRARY_PATH",
-                binary_library_path(&root, manifest.launch.path(&manifest)),
-            )
+            .env("LD_LIBRARY_PATH", binary_library_path(&manifest, &root))
             .env("YAM_API_URL", api_url)
             .env("YAM_API_TOKEN", token)
             .env("YAM_PLUGIN_ID", task_id)
@@ -1893,18 +1824,47 @@ async fn run_binary(
     result
 }
 
-fn binary_library_path(root: &Path, executable: &str) -> String {
-    let bundled = Path::new(executable)
-        .parent()
-        .and_then(Path::parent)
-        .map(|directory| root.join(directory).join("lib"));
-    match bundled.filter(|directory| directory.is_dir()) {
-        Some(directory) => match std::env::var("LD_LIBRARY_PATH") {
-            Ok(existing) if !existing.is_empty() => format!("{}:{existing}", directory.display()),
-            _ => directory.display().to_string(),
-        },
-        None => std::env::var("LD_LIBRARY_PATH").unwrap_or_default(),
+// Packages converted before `launch.interpreter` / `launch.library_paths`
+// existed carry an apkg `<id>/<id>-run` script and `<prefix>/lib` next to
+// `<prefix>/bin`; both are only guessed when the manifest is silent.
+fn launch_program(
+    manifest: &Manifest,
+    root: &Path,
+    executable: &str,
+) -> (Option<&'static str>, PathBuf) {
+    if manifest.launch.interpreter.as_deref() == Some("sh") {
+        return (Some("sh"), root.join(executable));
     }
+    let legacy_runner = root.join(&manifest.id).join(format!("{}-run", manifest.id));
+    if manifest.launch.interpreter.is_none() && legacy_runner.is_file() {
+        return (Some("sh"), legacy_runner);
+    }
+    (None, root.join(executable))
+}
+fn binary_library_path(manifest: &Manifest, root: &Path) -> String {
+    let bundled: Vec<PathBuf> = if manifest.launch.library_paths.is_empty() {
+        Path::new(manifest.launch.path(manifest))
+            .parent()
+            .and_then(Path::parent)
+            .map(|directory| root.join(directory).join("lib"))
+            .filter(|directory| directory.is_dir())
+            .into_iter()
+            .collect()
+    } else {
+        manifest
+            .launch
+            .library_paths
+            .iter()
+            .map(|directory| root.join(directory))
+            .collect()
+    };
+    let existing = std::env::var("LD_LIBRARY_PATH").unwrap_or_default();
+    bundled
+        .iter()
+        .map(|directory| directory.display().to_string())
+        .chain((!existing.is_empty()).then_some(existing))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 async fn run_package(
@@ -2242,7 +2202,10 @@ async fn put_device(
     Json(d): Json<DeviceProfile>,
 ) -> Result<StatusCode, ApiError> {
     validate_id(&d.model)?;
-    fs::write(a.root.join("device.toml"), toml::to_string_pretty(&d)?)?;
+    write_atomic(
+        &a.root.join("device.toml"),
+        toml::to_string_pretty(&d)?.as_bytes(),
+    )?;
     *a.device.lock().await = d;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2256,7 +2219,10 @@ async fn put_settings(
     if s.web.ui && !s.web.api {
         return Err(ApiError(anyhow!("web.ui requires web.api")));
     }
-    fs::write(a.root.join("settings.toml"), toml::to_string_pretty(&s)?)?;
+    write_atomic(
+        &a.root.join("settings.toml"),
+        toml::to_string_pretty(&s)?.as_bytes(),
+    )?;
     *a.settings.lock().await = s.clone();
     *a.led.settings.lock().await = s.led;
     Ok(StatusCode::NO_CONTENT)
@@ -2348,6 +2314,19 @@ fn stage_release_update(executable: &Path, data_dir: &Path, listen: &str) -> Res
     Ok(true)
 }
 
+/// Binary packages reach the daemon on loopback unless it listens on one address only.
+fn runtime_api_url(listen: &str) -> Result<String> {
+    let mut address: std::net::SocketAddr = listen
+        .parse()
+        .with_context(|| format!("listen address {listen} must be IP:port"))?;
+    if address.ip().is_unspecified() {
+        address.set_ip(match address {
+            std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+            std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+        });
+    }
+    Ok(format!("http://{address}"))
+}
 fn start_auto_updater(app: App, executable: PathBuf, listen: String) {
     task::spawn(async move {
         loop {
@@ -2384,33 +2363,43 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     fs::create_dir_all(&args.data_dir)?;
     let settings_path = args.data_dir.join("settings.toml");
-    let has_settings = settings_path.exists();
-    let mut settings: Settings = fs::read_to_string(&settings_path)
-        .ok()
-        .and_then(|x| toml::from_str(&x).ok())
-        .unwrap_or_default();
-    if !has_settings && Path::new("/sys/class/leds/micro:red:ring1/brightness").exists() {
-        settings.led.profile = "micro".into();
-        settings.led.count = 3;
-    }
-    if !has_settings && Path::new("/sys/class/leds/cucumber:red:ring0/brightness").exists() {
-        settings.led.profile = "midi".into();
-        settings.led.count = 24;
-    }
-    if !has_settings && Path::new("/sys/class/leds/plum:red:ring1/brightness").exists() {
-        settings.led.profile = "plum".into();
-        settings.led.count = 3;
-    }
+    // A broken settings.toml must not silently fall back to defaults: they
+    // re-enable the web API and auto-updates.
+    let settings: Settings = match fs::read_to_string(&settings_path) {
+        Ok(raw) => {
+            toml::from_str(&raw).with_context(|| format!("invalid {}", settings_path.display()))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut settings = Settings::default();
+            if let Some((profile, count)) = detect_led_profile(&settings.led.sysfs_root) {
+                settings.led.profile = profile.into();
+                settings.led.count = count;
+            }
+            settings
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("read {}", settings_path.display()))
+        }
+    };
     let led = Arc::new(Led {
         settings: Arc::new(Mutex::new(settings.led.clone())),
     });
     let mut device = detect_device(&args.data_dir, args.model);
-    if configured_rgb_ring(&settings.led) {
-        device.features.push("led.ring.rgb".into());
-        device
-            .features
-            .push(format!("led.ring.{}", settings.led.count));
-        device.features.push("led.pattern.v1".into());
+    let led_features = if configured_rgb_ring(&settings.led) {
+        vec![
+            "led.ring.rgb".into(),
+            format!("led.ring.{}", settings.led.count),
+            "led.pattern.v1".into(),
+        ]
+    } else if Path::new(&settings.led.sysfs_root).exists() {
+        vec!["led.sysfs".into()]
+    } else {
+        vec![]
+    };
+    for feature in led_features {
+        if !device.features.contains(&feature) {
+            device.features.push(feature);
+        }
     }
     tracing::info!(model=%device.model,features=?device.features,"detected device");
     let app = App {
@@ -2422,13 +2411,7 @@ async fn main() -> Result<()> {
             args.data_dir.join("plugins"),
         )?)),
         runtime_tokens: Arc::new(Mutex::new(HashMap::new())),
-        runtime_api_url: format!(
-            "http://127.0.0.1:{}",
-            args.listen
-                .rsplit(':')
-                .next()
-                .context("listen address has no port")?
-        ),
+        runtime_api_url: runtime_api_url(&args.listen)?,
     };
     start_auto_updater(app.clone(), std::env::current_exe()?, args.listen.clone());
     let services = {
@@ -2492,3 +2475,116 @@ async fn main() -> Result<()> {
     Ok(())
 }
 const UI: &str = include_str!("../web/index.html");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_recognized_phrase() {
+        // QuasarMessage.alice_state (3), AliceState.recognized_phrase (2) = "hi".
+        let message = [0x1a, 0x04, 0x12, 0x02, b'h', b'i'];
+        let event = decode_ipc_event("aliced", &message).unwrap().unwrap();
+        assert_eq!(event["transcript"], "hi");
+    }
+
+    #[test]
+    fn decodes_fired_alarm() {
+        // QuasarMessage.alarm_event (215), AlarmEvent.alarm_fired (1), Alarm{id:"a1", type:TIMER}.
+        let message = [
+            0xba, 0x0d, 0x08, 0x0a, 0x06, 0x0a, 0x02, b'a', b'1', 0x10, 0x02,
+        ];
+        let event = decode_ipc_event("alarmd", &message).unwrap().unwrap();
+        assert_eq!(event["id"], "a1");
+        assert_eq!(event["alarm_type"], 2);
+    }
+
+    #[test]
+    fn maps_cucumber_clock_segments() {
+        let layout = ClockLayout::Cucumber("cucumber:".into());
+        assert_eq!(layout.segments().len(), 45);
+        assert_eq!(
+            layout.path("PLUS1"),
+            Path::new("/sys/class/leds/cucumber:white:clock-p3/brightness")
+        );
+        assert_eq!(
+            layout.path("G4"),
+            Path::new("/sys/class/leds/cucumber:white:clock-g4/brightness")
+        );
+    }
+
+    #[test]
+    fn maps_plum_clock_segments() {
+        let layout = ClockLayout::Plum("plum:white:".into());
+        // 8 parts x 4 positions + DEGREE + DH + DM + DL.
+        assert_eq!(layout.segments().len(), 36);
+        assert!(layout.segments().contains(&"A0".to_string()));
+        assert!(layout.segments().contains(&"H3".to_string()));
+        assert!(layout.segments().contains(&"DH".to_string()));
+        assert!(!layout.segments().contains(&"PLUS1".to_string()));
+        assert_eq!(
+            layout.path("A0"),
+            Path::new("/sys/class/leds/plum:white:clockA0/brightness")
+        );
+        assert_eq!(
+            layout.path("DL"),
+            Path::new("/sys/class/leds/plum:white:clockDL/brightness")
+        );
+    }
+
+    #[test]
+    fn network_policy_rejects_local_address() {
+        let policy = NetworkPolicy {
+            allow: vec!["127.0.0.1".into()],
+            allow_insecure_http: true,
+        };
+        assert!(network_url_allowed(&policy, "http://127.0.0.1/").is_err());
+    }
+
+    #[test]
+    fn network_wildcard_allows_public_host() {
+        let policy = NetworkPolicy {
+            allow: vec!["*".into()],
+            allow_insecure_http: false,
+        };
+        assert!(network_url_allowed(&policy, "https://api.example.org/path").is_ok());
+    }
+    #[test]
+    fn led_paths_follow_profile_numbering() {
+        let settings = |profile: &str| LedSettings {
+            profile: profile.into(),
+            count: 6,
+            sysfs_root: "/sys/class/leds".into(),
+            path_template: Some("{root}/x{index}:{channel}".into()),
+        };
+        let path = |profile: &str| led_brightness_path(&settings(profile), "red", 0).unwrap();
+        assert_eq!(
+            path("mini2"),
+            Path::new("/sys/class/leds/mini2:red:ring1/brightness")
+        );
+        assert_eq!(
+            path("midi"),
+            Path::new("/sys/class/leds/cucumber:red:ring0/brightness")
+        );
+        assert_eq!(path("custom"), Path::new("/sys/class/leds/x1:red"));
+        assert!(led_brightness_path(&settings("nope"), "red", 0).is_err());
+    }
+
+    #[test]
+    fn color_parser_rejects_non_ascii_without_panicking() {
+        assert_eq!(parse_color("#0a0B10").unwrap(), (10, 11, 16));
+        assert!(parse_color("aéaaa").is_err());
+    }
+
+    #[test]
+    fn runtime_url_uses_loopback_for_wildcard_listen() {
+        assert_eq!(
+            runtime_api_url("0.0.0.0:8099").unwrap(),
+            "http://127.0.0.1:8099"
+        );
+        assert_eq!(
+            runtime_api_url("192.168.1.81:8099").unwrap(),
+            "http://192.168.1.81:8099"
+        );
+    }
+}

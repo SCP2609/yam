@@ -100,8 +100,18 @@ def quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def manifest(package: dict, program: Path, mode: str) -> str:
+def launch_details(root: Path, package: dict, program: Path) -> tuple[Path, str | None, list[str]]:
+    """apkg packages may ship `<name>/<name>-run` and bundle libraries in `<prefix>/lib`."""
+    libraries = [directory.as_posix() for directory in [program.parent.parent / "lib"] if len(program.parts) >= 2 and (root / directory).is_dir()]
+    runner = Path(package["name"]) / f"{package['name']}-run"
+    if (root / runner).is_file():
+        return runner, "sh", libraries
+    return program, None, libraries
+
+
+def manifest(package: dict, program: Path, mode: str, interpreter: str | None, libraries: list[str]) -> str:
     description = package.get("description", "")
+    launch_extra = ([f"interpreter = {quote(interpreter)}"] if interpreter else []) + ([f"library_paths = [{', '.join(quote(item) for item in libraries)}]"] if libraries else [])
     return "\n".join([
         f"id = {quote(package['name'])}",
         f"name = {quote(package['name'])}",
@@ -114,6 +124,7 @@ def manifest(package: dict, program: Path, mode: str) -> str:
         'kind = "binary"',
         f'mode = "{mode}"',
         f"path = {quote(program.as_posix())}",
+        *launch_extra,
         "",
         "[compatibility]",
         f"features = [{quote('arch.' + package.get('arch', 'aarch64'))}]",
@@ -122,6 +133,7 @@ def manifest(package: dict, program: Path, mode: str) -> str:
 
 
 def write_yap(source: Path, package: dict, program: Path, mode: str, output: Path) -> None:
+    program, interpreter, libraries = launch_details(source, package, program)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tarfile.open(output, "w:gz") as archive:
         def add_bytes(name: str, content: bytes, mode: int = 0o644) -> None:
@@ -130,7 +142,7 @@ def write_yap(source: Path, package: dict, program: Path, mode: str, output: Pat
             info.mode = mode
             archive.addfile(info, io.BytesIO(content))
 
-        add_bytes("plugin.toml", manifest(package, program, mode).encode())
+        add_bytes("plugin.toml", manifest(package, program, mode, interpreter, libraries).encode())
         add_bytes("launch.lua", b"")
         for path in sorted(source.rglob("*")):
             if not path.is_file():
