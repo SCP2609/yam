@@ -17,7 +17,7 @@ use std::{
     io::{Cursor, Read},
     net::TcpStream,
     path::{Component, Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -1784,11 +1784,9 @@ async fn run_binary(
     let result = task::spawn_blocking(move || -> Result<()> {
         let executable = manifest.launch.path(&manifest).to_string();
         safe_relative(&executable)?;
-        let log_path = root.join("runtime.log");
-        let log = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log_path)?;
+        let log = Arc::new(std::sync::Mutex::new(RotatingLog::open(
+            root.join("runtime.log"),
+        )?));
         let (interpreter, program) = launch_program(&manifest, &root, &executable);
         let mut command = match interpreter {
             Some(interpreter) => {
@@ -1806,9 +1804,13 @@ async fn run_binary(
             .env("YAM_API_URL", api_url)
             .env("YAM_API_TOKEN", token)
             .env("YAM_PLUGIN_ID", task_id)
-            .stdout(log.try_clone()?)
-            .stderr(log)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()?;
+        let pumps = [
+            pump_log(child.stdout.take(), log.clone()),
+            pump_log(child.stderr.take(), log),
+        ];
         loop {
             if cancelled.load(Ordering::Relaxed) {
                 let _ = child.kill();
@@ -1816,6 +1818,12 @@ async fn run_binary(
                 return Ok(());
             }
             if let Some(status) = child.try_wait()? {
+                for _ in 0..20 {
+                    if pumps.iter().all(std::thread::JoinHandle::is_finished) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
                 if status.success() {
                     return Ok(());
                 }
@@ -1845,6 +1853,49 @@ fn launch_program(
         return (Some("sh"), legacy_runner);
     }
     (None, root.join(executable))
+}
+struct RotatingLog {
+    path: PathBuf,
+    file: fs::File,
+    size: u64,
+}
+impl RotatingLog {
+    const LIMIT: u64 = 1_048_576;
+    fn open(path: PathBuf) -> std::io::Result<Self> {
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let size = file.metadata()?.len();
+        Ok(Self { path, file, size })
+    }
+    fn write(&mut self, data: &[u8]) -> std::io::Result<()> {
+        use std::io::Write;
+        if self.size > Self::LIMIT {
+            fs::rename(&self.path, self.path.with_extension("log.1"))?;
+            *self = Self::open(self.path.clone())?;
+        }
+        self.file.write_all(data)?;
+        self.size += data.len() as u64;
+        Ok(())
+    }
+}
+fn pump_log(
+    source: Option<impl Read + Send + 'static>,
+    log: Arc<std::sync::Mutex<RotatingLog>>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let Some(mut source) = source else {
+            return;
+        };
+        let mut buffer = [0; 8192];
+        while let Ok(read @ 1..) = source.read(&mut buffer) {
+            let mut log = log.lock().unwrap_or_else(|e| e.into_inner());
+            if log.write(&buffer[..read]).is_err() {
+                return;
+            }
+        }
+    })
 }
 fn binary_library_path(manifest: &Manifest, root: &Path) -> String {
     let bundled: Vec<PathBuf> = if manifest.launch.library_paths.is_empty() {
