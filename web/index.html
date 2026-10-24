@@ -91,6 +91,17 @@ function openTerminal(id) {
   terminalSocket.onerror = () => terminalInstance.writeln('\r\nНе удалось открыть терминал.');
   terminalSocket.onclose = () => terminalInstance.writeln('\r\nПроцесс завершён.');
   terminalInstance.onData(data => { if (terminalSocket.readyState === WebSocket.OPEN) terminalSocket.send(data); });
+  terminalInstance.attachCustomKeyEventHandler(event => {
+    if (event.type !== 'keydown' || terminalSocket.readyState !== WebSocket.OPEN) return true;
+    if ((event.ctrlKey || event.metaKey) && event.key.length === 1) {
+      const code = event.key.toUpperCase().charCodeAt(0) - 64;
+      if (code >= 1 && code <= 26) { terminalSocket.send(String.fromCharCode(code)); return false; }
+    }
+    if (event.altKey && !event.ctrlKey && event.key.length === 1) {
+      terminalSocket.send(`\x1b${event.key}`); return false;
+    }
+    return true;
+  });
 }
 function closeTerminal() { if (terminalSocket) terminalSocket.close(); if (terminalInstance) terminalInstance.dispose(); terminalDialog.close(); }
 function ringColors() { const list = colors.value.split(',').map(c => c.trim()).filter(Boolean); return list.length ? Array.from({ length: Number(count.value) || list.length }, (_, i) => list[i % list.length]) : list; }

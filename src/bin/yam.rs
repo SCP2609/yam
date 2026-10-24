@@ -303,7 +303,7 @@ fn open_tui(client: &Client, url: &str, id: &str, args: &[String]) -> Result<()>
         rendered_args,
     );
     let status = ProcessCommand::new("adb")
-        .args(["-s", &serial, "shell", &remote])
+        .args(["-s", &serial, "shell", "-t", &remote])
         .status()
         .context("start adb terminal")?;
     if !status.success() {
