@@ -38,6 +38,16 @@
   </section>
 <script>
 const api = '/api';
+const deviceElement = document.getElementById('device');
+const pluginsElement = document.getElementById('plugins');
+const uploadForm = document.getElementById('upload');
+const packageFile = document.getElementById('package-file');
+const uploadStatus = document.getElementById('upload-status');
+const profileInput = document.getElementById('profile');
+const countInput = document.getElementById('count');
+const binariesInput = document.getElementById('binaries');
+const updatesInput = document.getElementById('updates');
+const colorsInput = document.getElementById('colors');
 async function request(path, options) {
   const response = await fetch(api + path, options);
   if (!response.ok) throw new Error((await response.json().catch(() => ({}))).error || response.statusText);
@@ -53,35 +63,35 @@ function pluginRow(plugin) {
 async function load() {
   try {
     const [pluginData, settings, currentDevice] = await Promise.all([request('/plugins').then(r => r.json()), request('/settings').then(r => r.json()), request('/device').then(r => r.json())]);
-    device.textContent = `Колонка: ${currentDevice.model} · ${currentDevice.architecture} · ${currentDevice.features.join(', ')}`;
-    plugins.innerHTML = pluginData.map(pluginRow).join('') || 'Пакетов нет';
-    profile.value = settings.led.profile;
-    count.value = settings.led.count;
-    binaries.checked = settings.allow_plugin_binaries;
-    updates.checked = settings.updates.enabled;
+    deviceElement.textContent = `Колонка: ${currentDevice.model} · ${currentDevice.architecture} · ${currentDevice.features.join(', ')}`;
+    pluginsElement.innerHTML = pluginData.map(pluginRow).join('') || 'Пакетов нет';
+    profileInput.value = settings.led.profile;
+    countInput.value = settings.led.count;
+    binariesInput.checked = settings.allow_plugin_binaries;
+    updatesInput.checked = settings.updates?.enabled !== false;
   } catch (error) { alert(error.message); }
 }
 async function action(id, name) {
   try { await request(`/plugins/${id}${name === 'delete' ? '' : `/${name}`}`, { method: name === 'delete' ? 'DELETE' : 'POST' }); await load(); } catch (error) { alert(error.message); }
 }
-upload.onsubmit = async event => {
+uploadForm.onsubmit = async event => {
   event.preventDefault();
   const file = packageFile.files[0];
   if (!file) return;
   if (file.size > 64 * 1024 * 1024) return alert('Пакет больше 64 МиБ');
   uploadStatus.textContent = `Загрузка ${file.name}…`;
-  try { const form = new FormData(); form.append('package', file, file.name); await request('/plugins', { method: 'POST', body: form }); upload.reset(); await load(); uploadStatus.textContent = 'Установлено'; } catch (error) { uploadStatus.textContent = ''; alert(error.message); }
+  try { const form = new FormData(); form.append('package', file, file.name); await request('/plugins', { method: 'POST', body: form }); uploadForm.reset(); await load(); uploadStatus.textContent = 'Установлено'; } catch (error) { uploadStatus.textContent = ''; alert(error.message); }
 };
-function ringColors() { const list = colors.value.split(',').map(c => c.trim()).filter(Boolean); return list.length ? Array.from({ length: Number(count.value) || list.length }, (_, i) => list[i % list.length]) : list; }
+function ringColors() { const list = colorsInput.value.split(',').map(c => c.trim()).filter(Boolean); return list.length ? Array.from({ length: Number(countInput.value) || list.length }, (_, i) => list[i % list.length]) : list; }
 async function setLed() { try { await request('/led', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ colors: ringColors() }) }); } catch (error) { alert(error.message); } }
 async function turnOff() { try { await request('/led/off', { method: 'POST' }); } catch (error) { alert(error.message); } }
 const ZONE_COUNTS = { mini2: 6, micro: 3, midi: 24, plum: 3 };
 function syncCount() {
-  const zones = ZONE_COUNTS[profile.value];
-  if (zones) count.value = zones;
+  const zones = ZONE_COUNTS[profileInput.value];
+  if (zones) countInput.value = zones;
 }
 async function saveSettings() {
-  try { syncCount(); const settings = await request('/settings').then(r => r.json()); settings.led.profile = profile.value; settings.led.count = Number(count.value); settings.allow_plugin_binaries = binaries.checked; settings.updates.enabled = updates.checked; await request('/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings) }); } catch (error) { alert(error.message); }
+  try { syncCount(); const settings = await request('/settings').then(r => r.json()); settings.led.profile = profileInput.value; settings.led.count = Number(countInput.value); settings.allow_plugin_binaries = binariesInput.checked; settings.updates = { ...(settings.updates || {}), enabled: updatesInput.checked }; await request('/settings', { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings) }); } catch (error) { alert(error.message); }
 }
 load();
 </script>
