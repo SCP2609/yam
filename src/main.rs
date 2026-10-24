@@ -519,6 +519,9 @@ impl PluginManager {
         if !p.exists() {
             bail!("plugin not found")
         };
+        if let Some(token) = self.running.remove(id) {
+            token.store(true, Ordering::Relaxed);
+        }
         fs::remove_dir_all(p)?;
         self.enabled.remove(id);
         self.save()
