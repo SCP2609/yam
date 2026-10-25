@@ -85,7 +85,7 @@ curl -X POST -H "X-YAM-Token: $YAM_API_TOKEN" -H 'content-type: application/json
   -d '{"colors":["#4285F4","#EA4335","#FBBC05"]}' "$YAM_API_URL/led"
 ```
 
-Доступны `GET /device` (`exec`), `GET /sensors` (`sensors`), `POST /led`, `POST /led/off` (`led`) и `POST /clock` (`clock`). Форматы LED и clock совпадают с HTTP API YAM.
+Доступны `GET /device` (`exec`), `GET /sensors` (`sensors`), `POST /led`, `POST /led/off`, `POST /logo`, `POST /logo/off` (`led`; logo — 6 цветов, только при `led.logo.rgb`) и `POST /clock` (`clock`). Форматы LED и clock совпадают с HTTP API YAM.
 
 Для бинарного `oneshot`-пакета можно передать аргументы конкретного запуска. Они добавляются после статических `launch.args`:
 
