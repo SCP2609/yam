@@ -4,7 +4,7 @@ yam = Y Application Manager. Ставьте на свою колонку .yap.
 
 Linux / macOS:
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nyakokitsu/yam/main/install.sh | sh
+curl -fsSL https://hackalice.me/install.sh | sh
 ```
 
 Windows:
