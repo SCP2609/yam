@@ -36,19 +36,20 @@ enum Command {
     },
     Run {
         id: String,
-        #[arg(short, long)]
-        detach: bool,
-        #[arg(last = true)]
+        /// Arguments passed directly to the program; `--` is optional.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
-    },
-    Stop {
-        id: String,
     },
     Rm {
         id: String,
     },
     Logs {
         id: String,
+    },
+    /// Manage background service packages.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
     },
     /// Open an interactive ADB terminal for an enabled binary oneshot package.
     Tui {
@@ -84,6 +85,33 @@ enum Command {
 enum RegistryCommand {
     List,
     Pull { id: String, version: Option<String> },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Enable a service and start it now.
+    Enable {
+        id: String,
+    },
+    /// Stop a service and prevent it from starting after reboot.
+    Disable {
+        id: String,
+    },
+    /// Start an enabled service.
+    Start {
+        id: String,
+    },
+    Stop {
+        id: String,
+    },
+    Restart {
+        id: String,
+    },
+    /// Show installed service packages and their state.
+    List,
+    Logs {
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -133,13 +161,13 @@ fn main() -> Result<()> {
                     .post(endpoint(&cli.url, "/api/plugins"))
                     .multipart(multipart::Form::new().part("package", part))
                     .send()?;
-                print_response(response)?;
+                print_install_response(response)?;
             }
         }
         Command::List => {
             let packages: Value =
                 json_response(client.get(endpoint(&cli.url, "/api/plugins")).send()?)?;
-            println!("{}", serde_json::to_string_pretty(&packages)?);
+            print_packages(&packages, false);
         }
         Command::Ps => {
             let packages: Value =
@@ -151,33 +179,23 @@ fn main() -> Result<()> {
                 .iter()
                 .filter(|package| package["running"] == true)
                 .collect::<Vec<_>>();
-            println!("{}", serde_json::to_string_pretty(&running)?);
+            print_packages(&Value::Array(running.into_iter().cloned().collect()), false);
         }
         Command::Enable { id } => set_enabled(&client, &cli.url, &id, true)?,
         Command::Disable { id } => set_enabled(&client, &cli.url, &id, false)?,
-        Command::Run { id, detach, args } => {
-            let log_offset = if detach {
-                0
-            } else {
-                package_logs(&client, &cli.url, &id)?.len()
-            };
+        Command::Run { id, args } => {
+            ensure_package_kind(&client, &cli.url, &id, "binary", "oneshot")?;
+            let log_offset = package_logs(&client, &cli.url, &id)?.len();
             print_response(
                 client
                     .post(endpoint(&cli.url, &format!("/api/plugins/{id}/invoke")))
                     .json(&serde_json::json!({"args": args}))
                     .send()?,
             )?;
-            if !detach {
-                wait_for_package(&client, &cli.url, &id)?;
-                let log = package_logs(&client, &cli.url, &id)?;
-                print!("{}", log.get(log_offset..).unwrap_or(&log));
-            }
+            wait_for_package(&client, &cli.url, &id)?;
+            let log = package_logs(&client, &cli.url, &id)?;
+            print!("{}", log.get(log_offset..).unwrap_or(&log));
         }
-        Command::Stop { id } => print_response(
-            client
-                .post(endpoint(&cli.url, &format!("/api/plugins/{id}/stop")))
-                .send()?,
-        )?,
         Command::Rm { id } => print_response(
             client
                 .delete(endpoint(&cli.url, &format!("/api/plugins/{id}")))
@@ -188,6 +206,7 @@ fn main() -> Result<()> {
                 .get(endpoint(&cli.url, &format!("/api/plugins/{id}/logs")))
                 .send()?,
         )?,
+        Command::Service { command } => service_command(&client, &cli.url, command)?,
         Command::Tui { id, args } => open_tui(&client, &cli.url, &id, &args)?,
         Command::Inspect { id } => {
             let packages: Value =
@@ -403,7 +422,7 @@ fn install_registry_package(
         }))
         .send()?;
     if daemon_response.status().is_success() {
-        return print_response(daemon_response);
+        return print_install_response(daemon_response);
     }
     let status = daemon_response.status();
     let message = daemon_response.text()?;
@@ -455,6 +474,149 @@ fn print_response(response: reqwest::blocking::Response) -> Result<()> {
         println!("{text}");
     }
     Ok(())
+}
+
+fn print_install_response(response: reqwest::blocking::Response) -> Result<()> {
+    let manifest: Value = response.error_for_status()?.json()?;
+    let id = manifest["id"]
+        .as_str()
+        .context("install response has no package ID")?;
+    let name = manifest["name"].as_str().unwrap_or(id);
+    let version = manifest["version"].as_str().unwrap_or("?");
+    println!("Installed {name} ({id} {version}).");
+    println!("Enable it before use: yam enable {id}");
+    println!("For a background package: yam service enable {id}");
+    Ok(())
+}
+
+fn package(client: &Client, url: &str, id: &str) -> Result<Value> {
+    let packages = json_response(client.get(endpoint(url, "/api/plugins")).send()?)?;
+    packages
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["manifest"]["id"] == id))
+        .cloned()
+        .context("package not found")
+}
+
+fn ensure_package_kind(client: &Client, url: &str, id: &str, kind: &str, mode: &str) -> Result<()> {
+    let package = package(client, url, id)?;
+    if package["manifest"]["launch"]["kind"] != kind
+        || package["manifest"]["launch"]["mode"] != mode
+    {
+        bail!("{id} is not a {kind} {mode} package")
+    }
+    if package["enabled"] != true {
+        bail!("{id} is disabled; enable it first with yam enable {id}")
+    }
+    Ok(())
+}
+
+fn service_command(client: &Client, url: &str, command: ServiceCommand) -> Result<()> {
+    match command {
+        ServiceCommand::List => {
+            let packages = json_response(client.get(endpoint(url, "/api/plugins")).send()?)?;
+            print_packages(&packages, true);
+        }
+        ServiceCommand::Enable { id } => {
+            let was_enabled = package(client, url, &id)?["enabled"] == true;
+            ensure_service(client, url, &id, false)?;
+            set_enabled(client, url, &id, true)?;
+            if was_enabled {
+                print_response(
+                    client
+                        .post(endpoint(url, &format!("/api/plugins/{id}/service/start")))
+                        .send()?,
+                )?;
+            }
+            println!("Service {id} is enabled and running.");
+        }
+        ServiceCommand::Disable { id } => {
+            ensure_service(client, url, &id, false)?;
+            set_enabled(client, url, &id, false)?;
+            println!("Service {id} is disabled.");
+        }
+        ServiceCommand::Start { id } => {
+            ensure_service(client, url, &id, true)?;
+            print_response(
+                client
+                    .post(endpoint(url, &format!("/api/plugins/{id}/service/start")))
+                    .send()?,
+            )?;
+            println!("Service {id} started.");
+        }
+        ServiceCommand::Stop { id } => {
+            ensure_service(client, url, &id, false)?;
+            print_response(
+                client
+                    .post(endpoint(url, &format!("/api/plugins/{id}/stop")))
+                    .send()?,
+            )?;
+            println!("Service {id} stopped.");
+        }
+        ServiceCommand::Restart { id } => {
+            ensure_service(client, url, &id, true)?;
+            print_response(
+                client
+                    .post(endpoint(url, &format!("/api/plugins/{id}/stop")))
+                    .send()?,
+            )?;
+            print_response(
+                client
+                    .post(endpoint(url, &format!("/api/plugins/{id}/service/start")))
+                    .send()?,
+            )?;
+            println!("Service {id} restarted.");
+        }
+        ServiceCommand::Logs { id } => {
+            ensure_service(client, url, &id, false)?;
+            print_response(
+                client
+                    .get(endpoint(url, &format!("/api/plugins/{id}/logs")))
+                    .send()?,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn ensure_service(client: &Client, url: &str, id: &str, must_be_enabled: bool) -> Result<()> {
+    let package = package(client, url, id)?;
+    if package["manifest"]["launch"]["mode"] != "service" {
+        bail!("{id} is a oneshot package; run it with yam run {id}")
+    }
+    if must_be_enabled && package["enabled"] != true {
+        bail!("{id} is disabled; enable it first with yam service enable {id}")
+    }
+    Ok(())
+}
+
+fn print_packages(packages: &Value, services_only: bool) {
+    let Some(packages) = packages.as_array() else {
+        return;
+    };
+    println!("ID\tVERSION\tTYPE\tMODE\tSTATE");
+    for package in packages {
+        let manifest = &package["manifest"];
+        let mode = manifest["launch"]["mode"].as_str().unwrap_or("oneshot");
+        if services_only && mode != "service" {
+            continue;
+        }
+        let state = if package["running"] == true {
+            "running"
+        } else if package["enabled"] == true {
+            "enabled"
+        } else {
+            "disabled"
+        };
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            manifest["id"].as_str().unwrap_or("?"),
+            manifest["version"].as_str().unwrap_or("?"),
+            manifest["launch"]["kind"].as_str().unwrap_or("lua"),
+            mode,
+            state
+        );
+    }
 }
 
 fn set_enabled(client: &Client, url: &str, id: &str, desired: bool) -> Result<()> {

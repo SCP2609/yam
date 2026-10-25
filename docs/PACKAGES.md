@@ -18,7 +18,7 @@ path = "main.lua"
 features = ["led.ring.rgb"]
 ```
 
-`oneshot` запускается через `yam run`; включённый `service` восстанавливается после перезапуска daemon. Lua-сервисы должны регулярно вызывать `alice.sleep` или `alice.set`.
+Перед использованием включите пакет. `oneshot` запускается и ждёт завершения в текущем терминале; его stdout/stderr выводится сразу. Включённый `service` работает в фоне и восстанавливается после перезапуска daemon.
 
 Binary-пакет требует `exec`, должен соответствовать архитектуре колонки (обычно AArch64 musl) и может задать `args`, `interpreter = "sh"` и `library_paths`. Его вывод доступен через `yam logs <id>`.
 
@@ -26,10 +26,13 @@ Binary-пакет требует `exec`, должен соответствова
 yam install package.yap          # локальный архив
 yam install nano                 # последняя версия из registry
 yam install nano 8.0             # конкретная версия
-yam enable nano
-yam run nano -- --help
+yam enable zip                   # обязательно для oneshot
+yam run zip --help                # аргументы передаются без обязательного --
 yam tui nano                     # интерактивный binary oneshot через ADB
-yam stop nano
+yam service enable sensor-agent  # включить и запустить фоновый пакет
+yam service logs sensor-agent
+yam service restart sensor-agent
+yam service stop sensor-agent
 yam rm nano
 ```
 

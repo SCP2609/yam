@@ -2290,13 +2290,24 @@ async fn run_package(
     }
 }
 
-async fn start_package(app: App, id: String, invocation_args: Vec<String>) -> Result<()> {
+async fn start_package(
+    app: App,
+    id: String,
+    invocation_args: Vec<String>,
+    expected_mode: Option<LaunchMode>,
+) -> Result<()> {
     let cancelled = {
         let mut plugins = app.plugins.lock().await;
         if !plugins.enabled.contains(&id) {
             bail!("package is disabled")
         }
         let manifest = plugins.manifest(&id)?;
+        if expected_mode
+            .as_ref()
+            .is_some_and(|mode| manifest.launch.mode != *mode)
+        {
+            bail!("package launch mode does not support this command")
+        }
         if manifest.launch.kind == LaunchKind::Binary
             && !app.settings.lock().await.allow_plugin_binaries
         {
@@ -2471,7 +2482,7 @@ async fn toggle(
     p.save()?;
     drop(p);
     if enabled && manifest.launch.mode == LaunchMode::Service {
-        start_package(a, id, Vec::new()).await?;
+        start_package(a, id, Vec::new(), Some(LaunchMode::Service)).await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2491,8 +2502,16 @@ async fn invoke(
         a,
         id,
         invocation.map(|value| value.0.args).unwrap_or_default(),
+        Some(LaunchMode::Oneshot),
     )
     .await?;
+    Ok(StatusCode::ACCEPTED)
+}
+async fn start_service(
+    State(a): State<App>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    start_package(a, id, Vec::new(), Some(LaunchMode::Service)).await?;
     Ok(StatusCode::ACCEPTED)
 }
 async fn stop_plugin(
@@ -2858,7 +2877,14 @@ async fn main() -> Result<()> {
             .collect::<Vec<_>>()
     };
     for id in services {
-        if let Err(error) = start_package(app.clone(), id.clone(), Vec::new()).await {
+        if let Err(error) = start_package(
+            app.clone(),
+            id.clone(),
+            Vec::new(),
+            Some(LaunchMode::Service),
+        )
+        .await
+        {
             tracing::error!(package = %id, %error, "service package failed to start");
         }
     }
@@ -2881,6 +2907,7 @@ async fn main() -> Result<()> {
             .route("/api/plugins/:id", delete(remove))
             .route("/api/plugins/:id/toggle", post(toggle))
             .route("/api/plugins/:id/invoke", post(invoke))
+            .route("/api/plugins/:id/service/start", post(start_service))
             .route("/api/plugins/:id/stop", post(stop_plugin))
             .route("/api/plugins/:id/logs", get(package_logs))
             .route("/api/runtime/:id/device", get(runtime_device))

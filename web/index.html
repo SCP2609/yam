@@ -59,10 +59,12 @@ function escapeHtml(value) {
 function pluginRow(plugin) {
   const { manifest, enabled, running, compatible, incompatibility } = plugin;
   const id = escapeHtml(manifest.id);
+  const service = manifest.launch.mode === 'service';
   const run = compatible ? (running ? 'Перезапустить' : 'Запустить') : 'Несовместим';
   const disabled = compatible ? '' : `disabled title="${escapeHtml(incompatibility)}"`;
   const stop = running ? `<button onclick="action('${id}', 'stop')">Остановить</button>` : '';
-  return `<div class="plugin"><span><b>${escapeHtml(manifest.name)}</b> <small>${id} · ${escapeHtml(manifest.version)}<br>${escapeHtml(manifest.description)}</small></span><button onclick="action('${id}', 'toggle')">${enabled ? 'Выключить' : 'Включить'}</button><button ${disabled} onclick="action('${id}', 'invoke')">${run}</button>${stop}<button onclick="action('${id}', 'delete')">Удалить</button></div>`;
+  const launch = service ? `<button ${disabled} onclick="action('${id}', 'service/start')">${run}</button>` : `<button ${disabled} onclick="action('${id}', 'invoke')">Запустить</button>`;
+  return `<div class="plugin"><span><b>${escapeHtml(manifest.name)}</b> <small>${id} · ${escapeHtml(manifest.version)} · ${service ? 'service' : 'oneshot'}<br>${escapeHtml(manifest.description)}</small></span><button onclick="action('${id}', 'toggle')">${enabled ? 'Выключить' : 'Включить'}</button>${launch}${stop}<button onclick="action('${id}', 'delete')">Удалить</button></div>`;
 }
 async function load() {
   try {
@@ -84,7 +86,7 @@ uploadForm.onsubmit = async event => {
   if (!file) return;
   if (file.size > 64 * 1024 * 1024) return alert('Пакет больше 64 МиБ');
   uploadStatus.textContent = `Загрузка ${file.name}…`;
-  try { const form = new FormData(); form.append('package', file, file.name); await request('/plugins', { method: 'POST', body: form }); uploadForm.reset(); await load(); uploadStatus.textContent = 'Установлено'; } catch (error) { uploadStatus.textContent = ''; alert(error.message); }
+  try { const form = new FormData(); form.append('package', file, file.name); await request('/plugins', { method: 'POST', body: form }); uploadForm.reset(); await load(); uploadStatus.textContent = 'Установлено. Включите пакет перед запуском.'; } catch (error) { uploadStatus.textContent = ''; alert(error.message); }
 };
 function ringColors() { const list = colorsInput.value.split(',').map(c => c.trim()).filter(Boolean); return list.length ? Array.from({ length: Number(countInput.value) || list.length }, (_, i) => list[i % list.length]) : list; }
 async function setLed() { try { await request('/led', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ colors: ringColors() }) }); } catch (error) { alert(error.message); } }
