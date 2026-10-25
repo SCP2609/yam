@@ -1109,14 +1109,33 @@ fn http_request(
         .read_to_string(&mut response_body)?;
     Ok((status, response_body))
 }
+const QUASAR_CONFIG: &str = "/system/vendor/quasar/quasar.cfg";
+/// Extract only `<service>.port` from quasar.cfg; the rest of the file holds secrets.
+fn quasar_service_port(config: &str, service: &str) -> Result<Option<u16>> {
+    let value: serde_json::Value =
+        serde_json::from_str(config).context("invalid quasar config JSON")?;
+    Ok(value
+        .get(service)
+        .and_then(|entry| entry.get("port"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|port| u16::try_from(port).ok()))
+}
 fn ipc_endpoint(service: &str) -> Result<String> {
     let variable = match service {
         "alarmd" => "YAM_ALARMD_ADDR",
         "aliced" => "YAM_ALICED_ADDR",
         _ => bail!("only alarmd and aliced IPC streams are available"),
     };
-    let address =
-        std::env::var(variable).with_context(|| format!("{variable} is not configured"))?;
+    let address = match std::env::var(variable) {
+        Ok(address) => address,
+        Err(_) => {
+            let port = std::fs::read_to_string(QUASAR_CONFIG)
+                .ok()
+                .and_then(|config| quasar_service_port(&config, service).ok().flatten())
+                .with_context(|| format!("{variable} is not configured"))?;
+            format!("127.0.0.1:{port}")
+        }
+    };
     address
         .parse::<std::net::SocketAddr>()
         .context("invalid IPC address")?;
@@ -1198,14 +1217,63 @@ fn varint_field(data: &[u8], field: u32) -> Result<Option<u64>> {
                 .flatten()
         }))
 }
+/// Unwrap the Midi envelope (field 252 = body, field 253 = QuasarMessage field
+/// number) into a plain QuasarMessage; other frames are returned unchanged.
+fn normalize_ipc_message(message: &[u8]) -> Result<Vec<u8>> {
+    let fields = protobuf_fields(message)?;
+    let kind = fields
+        .iter()
+        .find_map(|(number, wire, value)| (*number == 253 && *wire == 0).then_some(value));
+    let body = fields
+        .iter()
+        .find_map(|(number, wire, value)| (*number == 252 && *wire == 2).then_some(value));
+    let (Some(kind), Some(body)) = (kind, body) else {
+        return Ok(message.to_vec());
+    };
+    let kind = u64::from_le_bytes(
+        kind.as_slice()
+            .try_into()
+            .context("invalid envelope type")?,
+    );
+    let mut out = Vec::with_capacity(body.len() + 12);
+    push_varint(&mut out, kind << 3 | 2);
+    push_varint(&mut out, body.len() as u64);
+    out.extend_from_slice(body);
+    Ok(out)
+}
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value & 0x7f) as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
 fn decode_ipc_event(service: &str, message: &[u8]) -> Result<Option<serde_json::Value>> {
+    let message = normalize_ipc_message(message)?;
+    let message = message.as_slice();
     match service {
         "aliced" => {
             let Some(state) = nested_field(message, 3)? else {
                 return Ok(None);
             };
-            Ok(text_field(&state, 2)?
-                .map(|transcript| serde_json::json!({"type": "speech", "transcript": transcript})))
+            let is_command = match nested_field(&state, 10)? {
+                Some(source) => text_field(&source, 6)?.as_deref() == Some("command"),
+                None => false,
+            };
+            if is_command {
+                if let Some(request) = nested_field(&state, 15)? {
+                    if varint_field(&request, 2)?.unwrap_or(0) != 0 {
+                        if let Some(transcript) = text_field(&request, 1)? {
+                            return Ok(Some(
+                                serde_json::json!({"type": "speech", "source": "command", "transcript": transcript}),
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(text_field(&state, 2)?.map(|transcript| {
+                serde_json::json!({"type": "speech", "source": "voice", "transcript": transcript})
+            }))
         }
         "alarmd" => {
             let Some(event) = nested_field(message, 215)? else {
@@ -2615,6 +2683,90 @@ mod tests {
         let event = decode_ipc_event("alarmd", &message).unwrap().unwrap();
         assert_eq!(event["id"], "a1");
         assert_eq!(event["alarm_type"], 2);
+    }
+
+    fn pb_bytes(field: u32, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_varint(&mut out, u64::from(field) << 3 | 2);
+        push_varint(&mut out, body.len() as u64);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn pb_varint(field: u32, value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_varint(&mut out, u64::from(field) << 3);
+        push_varint(&mut out, value);
+        out
+    }
+
+    fn wrap(kind: u64, body: &[u8]) -> Vec<u8> {
+        let mut out = pb_bytes(252, body);
+        out.extend(pb_varint(253, kind));
+        out
+    }
+
+    #[test]
+    fn decodes_wrapped_recognized_phrase() {
+        let state = pb_bytes(2, b"hi");
+        let event = decode_ipc_event("aliced", &wrap(3, &state))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["type"], "speech");
+        assert_eq!(event["source"], "voice");
+        assert_eq!(event["transcript"], "hi");
+        // Other wrapped message types are ignored.
+        assert!(decode_ipc_event("aliced", &wrap(210, &state))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn decodes_wrapped_command_event() {
+        let mut state = pb_bytes(10, &pb_bytes(6, b"command"));
+        let mut request = pb_bytes(1, "стоп".as_bytes());
+        request.extend(pb_varint(2, 1));
+        state.extend(pb_bytes(15, &request));
+        let event = decode_ipc_event("aliced", &wrap(3, &state))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["source"], "command");
+        assert_eq!(event["transcript"], "стоп");
+
+        // Command wins over recognized_phrase in the same frame.
+        state.extend(pb_bytes(2, b"stop"));
+        let event = decode_ipc_event("aliced", &wrap(3, &state))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["source"], "command");
+        assert_eq!(event["transcript"], "стоп");
+
+        // Non-final command requests are ignored.
+        let mut partial = pb_bytes(1, b"sto");
+        partial.extend(pb_varint(2, 0));
+        let mut state = pb_bytes(10, &pb_bytes(6, b"command"));
+        state.extend(pb_bytes(15, &partial));
+        assert!(decode_ipc_event("aliced", &wrap(3, &state))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn decodes_wrapped_alarm() {
+        let alarm = [0x0a, 0x06, 0x0a, 0x02, b'a', b'1', 0x10, 0x02];
+        let event = decode_ipc_event("alarmd", &wrap(215, &alarm))
+            .unwrap()
+            .unwrap();
+        assert_eq!(event["id"], "a1");
+    }
+
+    #[test]
+    fn reads_only_service_port_from_quasar_config() {
+        let config = r#"{"token":"not-a-real-secret","aliced":{"port":9875,"x":"y"},"alarmd":{},"bad":{"port":"1"}}"#;
+        assert_eq!(quasar_service_port(config, "aliced").unwrap(), Some(9875));
+        assert_eq!(quasar_service_port(config, "alarmd").unwrap(), None);
+        assert_eq!(quasar_service_port(config, "bad").unwrap(), None);
+        assert_eq!(quasar_service_port(config, "missing").unwrap(), None);
     }
 
     #[test]
