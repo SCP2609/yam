@@ -17,13 +17,8 @@ irm https://raw.githubusercontent.com/nyakokitsu/yam/main/install.ps1 | iex
 
 # Документация
 
-- [Разработка](docs/DEVELOPMENT.md)
-- [API Плагинов](docs/PLUGIN_API.md)
-- [Деплой](docs/DEPLOYMENT.md)
-- [Пакеты](docs/PACKAGES.md)
-- [Реестр пакетов](docs/REGISTRY.md)
-- [Аппаратные возможности](docs/PLATFORM_HARDWARE.md)
-- [События IPC](docs/IPC.md)
-- [Для нейронок](AGENTS.md)
+- [Установка и эксплуатация](docs/DEPLOYMENT.md)
+- [Пакеты и CLI](docs/PACKAGES.md)
+- [Lua API плагинов](docs/PLUGIN_API.md)
 
 Примеры [`examples/`](examples/).

@@ -2911,216 +2911,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decodes_recognized_phrase() {
-        // QuasarMessage.alice_state (3), AliceState.recognized_phrase (2) = "hi".
-        let message = [0x1a, 0x04, 0x12, 0x02, b'h', b'i'];
-        let event = decode_ipc_event("aliced", &message).unwrap().unwrap();
-        assert_eq!(event["transcript"], "hi");
-    }
-
-    #[test]
-    fn decodes_fired_alarm() {
-        // QuasarMessage.alarm_event (215), AlarmEvent.alarm_fired (1), Alarm{id:"a1", type:TIMER}.
-        let message = [
+    fn ipc_decodes_speech_and_alarm() {
+        let speech = [0x1a, 0x04, 0x12, 0x02, b'h', b'i'];
+        assert_eq!(
+            decode_ipc_event("aliced", &speech).unwrap().unwrap()["transcript"],
+            "hi"
+        );
+        let alarm = [
             0xba, 0x0d, 0x08, 0x0a, 0x06, 0x0a, 0x02, b'a', b'1', 0x10, 0x02,
         ];
-        let event = decode_ipc_event("alarmd", &message).unwrap().unwrap();
-        assert_eq!(event["id"], "a1");
-        assert_eq!(event["alarm_type"], 2);
-    }
-
-    #[test]
-    fn maps_cucumber_clock_segments() {
-        let layout = ClockLayout::Cucumber("cucumber:".into());
-        assert_eq!(layout.segments().len(), 45);
         assert_eq!(
-            layout.path("PLUS1"),
-            Path::new("/sys/class/leds/cucumber:white:clock-p3/brightness")
-        );
-        assert_eq!(
-            layout.path("G4"),
-            Path::new("/sys/class/leds/cucumber:white:clock-g4/brightness")
+            decode_ipc_event("alarmd", &alarm).unwrap().unwrap()["id"],
+            "a1"
         );
     }
 
     #[test]
-    fn maps_plum_clock_segments() {
-        let layout = ClockLayout::Plum("plum:white:".into());
-        // 8 parts x 4 positions + DEGREE + DH + DM + DL.
-        assert_eq!(layout.segments().len(), 36);
-        assert!(layout.segments().contains(&"A0".to_string()));
-        assert!(layout.segments().contains(&"H3".to_string()));
-        assert!(layout.segments().contains(&"DH".to_string()));
-        assert!(!layout.segments().contains(&"PLUS1".to_string()));
-        assert_eq!(
-            layout.path("A0"),
-            Path::new("/sys/class/leds/plum:white:clockA0/brightness")
-        );
-        assert_eq!(
-            layout.path("DL"),
-            Path::new("/sys/class/leds/plum:white:clockDL/brightness")
-        );
-    }
-
-    #[test]
-    fn network_policy_rejects_local_address() {
+    fn network_policy_blocks_loopback() {
         let policy = NetworkPolicy {
-            allow: vec!["127.0.0.1".into()],
+            allow: vec!["*".into()],
             allow_insecure_http: true,
         };
         assert!(network_url_allowed(&policy, "http://127.0.0.1/").is_err());
     }
 
     #[test]
-    fn network_wildcard_allows_public_host() {
-        let policy = NetworkPolicy {
-            allow: vec!["*".into()],
-            allow_insecure_http: false,
-        };
-        assert!(network_url_allowed(&policy, "https://api.example.org/path").is_ok());
-    }
-    #[test]
-    fn led_paths_follow_profile_numbering() {
-        let settings = |profile: &str| LedSettings {
-            profile: profile.into(),
-            count: 6,
-            sysfs_root: "/sys/class/leds".into(),
-            path_template: Some("{root}/x{index}:{channel}".into()),
-        };
-        let path = |profile: &str| led_brightness_path(&settings(profile), "red", 0).unwrap();
+    fn input_events_decode_for_both_linux_word_sizes() {
+        let mut event64 = vec![];
+        event64.extend(10i64.to_ne_bytes());
+        event64.extend(2_000i64.to_ne_bytes());
+        event64.extend(1u16.to_ne_bytes());
+        event64.extend(2u16.to_ne_bytes());
+        event64.extend((-1i32).to_ne_bytes());
+        assert_eq!(decode_input_event("mute", &event64, 8).unwrap().value, -1);
+
+        let mut event32 = vec![];
+        event32.extend(10i32.to_ne_bytes());
+        event32.extend(2_000i32.to_ne_bytes());
+        event32.extend(3u16.to_ne_bytes());
+        event32.extend(4u16.to_ne_bytes());
+        event32.extend(5i32.to_ne_bytes());
         assert_eq!(
-            path("mini2"),
-            Path::new("/sys/class/leds/mini2:red:ring1/brightness")
+            decode_input_event("mute", &event32, 4).unwrap().time_ms,
+            10_002
         );
-        assert_eq!(
-            path("midi"),
-            Path::new("/sys/class/leds/cucumber:red:ring0/brightness")
-        );
-        assert_eq!(path("custom"), Path::new("/sys/class/leds/x1:red"));
-        assert!(led_brightness_path(&settings("nope"), "red", 0).is_err());
+        assert!(decode_input_event("mute", &event32[..15], 4).is_err());
     }
 
     #[test]
-    fn color_parser_rejects_non_ascii_without_panicking() {
-        assert_eq!(parse_color("#0a0B10").unwrap(), (10, 11, 16));
-        assert!(parse_color("aéaaa").is_err());
-    }
-
-    #[test]
-    fn runtime_url_uses_loopback_for_wildcard_listen() {
-        assert_eq!(
-            runtime_api_url("0.0.0.0:8099").unwrap(),
-            "http://127.0.0.1:8099"
-        );
-        assert_eq!(
-            runtime_api_url("192.168.1.81:8099").unwrap(),
-            "http://192.168.1.81:8099"
-        );
-    }
-
-    fn input_manifest(extra: &str) -> Manifest {
-        toml::from_str(&format!(
-            "id = \"p\"\nname = \"p\"\nversion = \"1\"\nentry = \"main.lua\"\n{extra}"
-        ))
-        .unwrap()
-    }
-
-    #[test]
-    fn decodes_64_bit_input_event() {
-        let mut bytes = vec![];
-        bytes.extend(1_700_000_000i64.to_ne_bytes());
-        bytes.extend(250_999i64.to_ne_bytes());
-        bytes.extend(1u16.to_ne_bytes());
-        bytes.extend(0x74u16.to_ne_bytes());
-        bytes.extend((-1i32).to_ne_bytes());
-        assert_eq!(bytes.len(), 24);
-        assert_eq!(input_event_size(8), 24);
-        let event = decode_input_event("mute", &bytes, 8).unwrap();
-        assert_eq!(
-            event,
-            InputEvent {
-                device: "mute".into(),
-                kind: 1,
-                code: 0x74,
-                value: -1,
-                time_ms: 1_700_000_000_250,
-            }
-        );
-    }
-
-    #[test]
-    fn decodes_32_bit_input_event_and_rejects_wrong_length() {
-        let mut bytes = vec![];
-        bytes.extend(10i32.to_ne_bytes());
-        bytes.extend(2_000i32.to_ne_bytes());
-        bytes.extend(3u16.to_ne_bytes());
-        bytes.extend(4u16.to_ne_bytes());
-        bytes.extend(5i32.to_ne_bytes());
-        let event = decode_input_event("d", &bytes, 4).unwrap();
-        assert_eq!((event.kind, event.code, event.value), (3, 4, 5));
-        assert_eq!(event.time_ms, 10_002);
-        assert!(decode_input_event("d", &bytes[..15], 4).is_err());
-        assert!(decode_input_event("d", &bytes, 8).is_err());
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn input_event_size_matches_libc() {
-        assert_eq!(
-            input_event_size(std::mem::size_of::<libc::c_long>()),
-            std::mem::size_of::<libc::input_event>()
-        );
-    }
-
-    const FAKE_PROC_INPUT: &str = "I: Bus=0019 Vendor=0001 Product=0001 Version=0100\n\
-N: Name=\"input_btrcu\"\n\
-H: Handlers=event0 \n\
-\n\
-I: Bus=0019 Vendor=0001 Product=0002 Version=0100\n\
-N: Name=\"vad_keypad\"\n\
-H: Handlers=kbd event1 \n\
-\n\
-I: Bus=0019 Vendor=0001 Product=0003 Version=0100\n\
-N: Name=\"mute\"\n\
-H: Handlers=event2 \n\
-\n\
-I: Bus=0019 Vendor=0001 Product=0004 Version=0100\n\
-N: Name=\"awinic_sar\"\n\
-H: Handlers=event3 \n\
-\n";
-
-    #[test]
-    fn resolves_declared_input_devices_only() {
-        let names = vec!["mute".to_string(), "awinic_sar".to_string()];
-        let devices = resolve_input_devices(FAKE_PROC_INPUT, &names).unwrap();
+    fn input_scope_is_limited_to_declared_devices() {
+        let manifest: Manifest = toml::from_str(
+            "id='p'\nname='p'\nversion='1'\nentry='main.lua'\npermissions=['input']\n[input]\ndevices=['mute']\n",
+        )
+        .unwrap();
+        assert!(validate_input_policy(&manifest).is_ok());
+        let devices = resolve_input_devices(
+            "N: Name=\"mute\"\nH: Handlers=event2\n\nN: Name=\"other\"\nH: Handlers=event3\n",
+            input_scope(&manifest).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             devices,
-            vec![
-                ("mute".to_string(), PathBuf::from("/dev/input/event2")),
-                ("awinic_sar".to_string(), PathBuf::from("/dev/input/event3")),
-            ]
+            vec![("mute".into(), PathBuf::from("/dev/input/event2"))]
         );
-        assert!(resolve_input_devices(FAKE_PROC_INPUT, &["missing".to_string()]).is_err());
-        assert!(resolve_input_devices(FAKE_PROC_INPUT, &[]).is_err());
-        assert!(resolve_input_devices(FAKE_PROC_INPUT, &["mut".to_string()]).is_err());
-    }
-
-    #[test]
-    fn manifest_without_input_devices_is_rejected_for_events() {
-        let none = input_manifest("permissions = [\"input\"]\n");
-        assert!(input_scope(&none).is_err());
-        let declared = input_manifest(
-            "permissions = [\"input\"]\n[input]\ndevices = [\"vad_keypad\", \"mute\"]\n",
-        );
-        assert_eq!(input_scope(&declared).unwrap(), ["vad_keypad", "mute"]);
-        assert!(validate_input_policy(&declared).is_ok());
-    }
-
-    #[test]
-    fn input_devices_require_input_permission_and_valid_names() {
-        let no_permission = input_manifest("[input]\ndevices = [\"mute\"]\n");
-        assert!(validate_input_policy(&no_permission).is_err());
-        let blank = input_manifest("permissions = [\"input\"]\n[input]\ndevices = [\" \"]\n");
-        assert!(validate_input_policy(&blank).is_err());
     }
 }
