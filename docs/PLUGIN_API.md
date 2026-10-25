@@ -58,7 +58,7 @@ tar -C package-source -czf my-package.yap plugin.toml main.lua assets/
 | `sensors` | `alice.sensors.list()`, `read(id)` | `sensor.ambient_light.iio`, `sensor.temperature.sysfs` или `battery.sysfs` |
 | `sensors.control` | `alice.sensors.configure_ambient_light(device, gain, integration_ms)` | `sensor.ambient_light.iio` |
 | `clock` | `alice.clock.available()`, `time("HH:MM", brightness)`, `segments(levels)`, `off()` | `display.clock.segment.v1` |
-| `input` | `alice.input.devices()` | `input.evdev` |
+| `input` | `alice.input.devices()`, `alice.input.next_event(timeout_ms)` | `input.evdev`; для `next_event` — непустой `[input].devices` |
 | `network` | `alice.http.get(url)`, `alice.http.post(url, body)` | непустой `[network].allow` |
 | `ipc.alarm` | `alice.ipc.next_alarm(timeout_ms)` | `YAM_ALARMD_ADDR` у daemon |
 | `ipc.speech` | `alice.ipc.next_speech(timeout_ms)` | `YAM_ALICED_ADDR` у daemon |
@@ -87,6 +87,30 @@ YAM подключается к **двум разрешённым** IPC-серв
 Администратор daemon задаёт адреса сервисов (обычно loopback-порты из конфигурации прошивки): `YAM_ALARMD_ADDR=127.0.0.1:PORT` и `YAM_ALICED_ADDR=127.0.0.1:PORT`. Это намеренно не настраивается пакетом.
 
 `alice.ipc.next_alarm(timeout_ms)` возвращает `nil` по тайм-ауту либо `{ type = "alarm_fired", id, alarm_type, start_timestamp_ms, duration_seconds, remind_message, currently_playing }`. `alice.ipc.next_speech(timeout_ms)` соответственно возвращает `nil` либо `{ type = "speech", transcript }`. Тайм-аут — до 60 секунд. Распознанная речь относится к персональным данным: запрашивайте `ipc.speech` только при необходимости, предупреждайте пользователя и не передавайте текст в сеть без одновременно объявленного `network`.
+
+### События кнопок и датчиков (evdev)
+
+`alice.input.next_event(timeout_ms)` читает сырые события Linux evdev. Пакет обязан перечислить нужные устройства по имени ядра в манифесте; без списка вызов завершается ошибкой, а остальные устройства не открываются. Имена сопоставляются с `/dev/input/eventN` по `/proc/bus/input/devices` точным совпадением (список имён даёт `alice.input.devices()`); несуществующее имя — ошибка. Для установки `[input].devices` нужен permission `input`.
+
+```toml
+permissions = ["input"]
+
+[input]
+devices = ["vad_keypad", "mute", "awinic_sar"]
+```
+
+Функция возвращает `nil` по тайм-ауту (до 60 секунд) либо `{ device, type, code, value, time_ms }`: `device` — имя из манифеста, `type`/`code`/`value` — поля `struct input_event` (`EV_KEY = 1`, `EV_SW = 5`, `EV_ABS = 3`), `time_ms` — время события ядра в миллисекундах. События `EV_SYN` пропускаются. YAM читает устройства без `EVIOCGRAB`, поэтому platformd продолжает получать те же события. Ожидание проверяет отмену не реже чем раз в 100 мс.
+
+```lua
+while true do
+  local ev = alice.input.next_event(1000)
+  if ev and ev.device == "mute" and ev.type == 5 then      -- EV_SW: переключатель микрофона
+    alice.set(ev.value == 1 and red or green)
+  elseif ev and ev.device == "awinic_sar" and ev.value > 0 then  -- ёмкостный датчик приближения
+    alice.set(blue)
+  end
+end
+```
 
 ### Датчики
 

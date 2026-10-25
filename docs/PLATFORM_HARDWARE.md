@@ -15,6 +15,8 @@ YAM не линкуется с закрытым SDK колонок. Вместо
 | Подсветка экрана | Android/TV platform конфигурации | `/sys/class/backlight` | `display.backlight` |
 | Кнопки | platform-specific ButtonsHandler | `/sys/class/input` и `/proc/bus/input/devices` | `input.evdev` |
 
+Для `input.evdev` YAM читает события только у устройств, перечисленных в `[input].devices` манифеста, и не захватывает их через `EVIOCGRAB`. На Midi (`yandex,cucumber`) доступны `input_btrcu` (`event0`), `vad_keypad` (`event1`, кнопки), `mute` (`event2`, переключатель микрофона) и `awinic_sar` (`event3`, ёмкостный датчик приближения); номера `eventN` определяются по имени в момент вызова, а не зашиты. Структура `input_event` на AArch64 занимает 24 байта.
+
 ## Не предоставляется намеренно
 
 - OTA, factory reset, ADB activation, power-off и прошивка Bluetooth/Zigbee контроллеров;

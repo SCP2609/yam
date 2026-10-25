@@ -133,6 +133,8 @@ struct Manifest {
     #[serde(default)]
     network: NetworkPolicy,
     #[serde(default)]
+    input: InputPolicy,
+    #[serde(default)]
     compatibility: Compatibility,
     #[serde(default)]
     launch: Launch,
@@ -144,6 +146,12 @@ struct NetworkPolicy {
     allow: Vec<String>,
     #[serde(default)]
     allow_insecure_http: bool,
+}
+/// Input devices a package may read through `alice.input.next_event`, by kernel device name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct InputPolicy {
+    #[serde(default)]
+    devices: Vec<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Launch {
@@ -500,6 +508,7 @@ impl PluginManager {
         if m.launch.kind == LaunchKind::Binary && !m.permissions.iter().any(|p| p == "exec") {
             bail!("binary packages require the exec permission")
         }
+        validate_input_policy(&m)?;
         if m.launch.kind == LaunchKind::Binary {
             let executable = stage.join(m.launch.path(&m));
             if !executable.is_file() {
@@ -1109,6 +1118,200 @@ fn http_request(
         .read_to_string(&mut response_body)?;
     Ok((status, response_body))
 }
+const EV_SYN: u16 = 0;
+/// Longest single `poll` wait, so a stopped plugin is noticed within about this long.
+const INPUT_POLL_SLICE_MS: u64 = 100;
+
+fn validate_input_policy(m: &Manifest) -> Result<()> {
+    if m.input.devices.is_empty() {
+        return Ok(());
+    }
+    if !m.permissions.iter().any(|p| p == "input") {
+        bail!("[input].devices requires the input permission")
+    }
+    if m.input.devices.len() > 16 {
+        bail!("[input].devices lists more than 16 devices")
+    }
+    for name in &m.input.devices {
+        if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+            bail!("[input].devices contains an invalid device name")
+        }
+    }
+    Ok(())
+}
+/// The device names a package declared; packages without a list get no input devices.
+fn input_scope(m: &Manifest) -> Result<&[String]> {
+    if m.input.devices.is_empty() {
+        bail!("alice.input.next_event requires a non-empty [input].devices manifest list")
+    }
+    Ok(&m.input.devices)
+}
+/// Maps declared device names to `/dev/input/eventN` using `/proc/bus/input/devices` text.
+/// Only exact name matches are returned; every declared name must exist.
+fn resolve_input_devices(proc_devices: &str, wanted: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    if wanted.is_empty() {
+        bail!("no input devices declared")
+    }
+    let mut available = vec![];
+    for block in proc_devices.split("\n\n") {
+        let mut name = None;
+        let mut event = None;
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("N: Name=") {
+                name = Some(value.trim().trim_matches('"').to_string());
+            } else if let Some(handlers) = line.strip_prefix("H: Handlers=") {
+                event = handlers.split_whitespace().find(|handler| {
+                    handler
+                        .strip_prefix("event")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                });
+            }
+        }
+        if let (Some(name), Some(event)) = (name, event) {
+            available.push((name, PathBuf::from("/dev/input").join(event)));
+        }
+    }
+    let mut resolved = vec![];
+    for name in wanted {
+        let before = resolved.len();
+        for (candidate, path) in &available {
+            if candidate == name {
+                resolved.push((name.clone(), path.clone()));
+            }
+        }
+        if resolved.len() == before {
+            bail!("input device {name:?} not found")
+        }
+    }
+    Ok(resolved)
+}
+#[derive(Debug, Clone, PartialEq)]
+struct InputEvent {
+    device: String,
+    kind: u16,
+    code: u16,
+    value: i32,
+    time_ms: i64,
+}
+/// Size of the kernel `struct input_event`: two `long` timestamp words plus type, code, value.
+fn input_event_size(word: usize) -> usize {
+    word * 2 + 8
+}
+fn read_input_word(bytes: &[u8], word: usize) -> i64 {
+    match word {
+        4 => i32::from_ne_bytes(bytes[..4].try_into().unwrap()) as i64,
+        _ => i64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+    }
+}
+/// Decodes one native-endian `struct input_event` whose timestamp words are `word` bytes wide.
+fn decode_input_event(device: &str, bytes: &[u8], word: usize) -> Result<InputEvent> {
+    if !matches!(word, 4 | 8) || bytes.len() != input_event_size(word) {
+        bail!("malformed input_event record")
+    }
+    let seconds = read_input_word(bytes, word);
+    let micros = read_input_word(&bytes[word..], word);
+    let tail = &bytes[word * 2..];
+    Ok(InputEvent {
+        device: device.to_string(),
+        kind: u16::from_ne_bytes([tail[0], tail[1]]),
+        code: u16::from_ne_bytes([tail[2], tail[3]]),
+        value: i32::from_ne_bytes([tail[4], tail[5], tail[6], tail[7]]),
+        time_ms: seconds * 1000 + micros / 1000,
+    })
+}
+struct InputSource {
+    name: String,
+    file: fs::File,
+}
+/// Read-only, non-grabbing evdev reader over the devices a package declared.
+struct InputReader {
+    sources: Vec<InputSource>,
+    pending: std::collections::VecDeque<InputEvent>,
+}
+impl InputReader {
+    fn open(devices: &[(String, PathBuf)]) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut sources = vec![];
+        for (name, path) in devices {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .with_context(|| format!("open input device {name:?} at {}", path.display()))?;
+            sources.push(InputSource {
+                name: name.clone(),
+                file,
+            });
+        }
+        Ok(Self {
+            sources,
+            pending: Default::default(),
+        })
+    }
+    /// Waits up to `timeout_ms` for the next non-`EV_SYN` event, checking `cancelled` between
+    /// `INPUT_POLL_SLICE_MS` waits.
+    fn next(&mut self, timeout_ms: u64, cancelled: &AtomicBool) -> Result<Option<InputEvent>> {
+        use std::os::unix::io::AsRawFd;
+        let word = std::mem::size_of::<libc::c_long>();
+        let size = input_event_size(word);
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut buffer = vec![0u8; size * 32];
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("plugin stopped")
+            }
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let wait = (remaining.as_millis() as u64).min(INPUT_POLL_SLICE_MS);
+            let mut fds: Vec<libc::pollfd> = self
+                .sources
+                .iter()
+                .map(|source| libc::pollfd {
+                    fd: source.file.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            let ready =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait as i32) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error).context("poll input devices");
+                }
+            } else if ready > 0 {
+                for (source, fd) in self.sources.iter_mut().zip(&fds) {
+                    if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                        bail!("input device {:?} is no longer available", source.name)
+                    }
+                    if fd.revents & libc::POLLIN == 0 {
+                        continue;
+                    }
+                    let length = match source.file.read(&mut buffer) {
+                        Ok(length) => length,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("read input device {:?}", source.name))
+                        }
+                    };
+                    for record in buffer[..length - length % size].chunks_exact(size) {
+                        let event = decode_input_event(&source.name, record, word)?;
+                        if event.kind != EV_SYN {
+                            self.pending.push_back(event);
+                        }
+                    }
+                }
+            }
+            if self.pending.is_empty() && std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
+}
 fn ipc_endpoint(service: &str) -> Result<String> {
     let variable = match service {
         "alarmd" => "YAM_ALARMD_ADDR",
@@ -1662,6 +1865,47 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                 "devices",
                 lua.create_function(|_, ()| {
                     fs::read_to_string("/proc/bus/input/devices").map_err(mlua::Error::external)
+                })?,
+            )?;
+            let input_manifest = manifest.clone();
+            let cancelled_input = cancelled.clone();
+            let mut reader: Option<InputReader> = None;
+            input.set(
+                "next_event",
+                lua.create_function_mut(move |lua, timeout_ms: u64| {
+                    if timeout_ms > 60_000 {
+                        return Err(mlua::Error::external(
+                            "input timeout is limited to 60 seconds",
+                        ));
+                    }
+                    if reader.is_none() {
+                        let opened = input_scope(&input_manifest)
+                            .and_then(|names| {
+                                let listing = fs::read_to_string("/proc/bus/input/devices")
+                                    .context("read /proc/bus/input/devices")?;
+                                resolve_input_devices(&listing, names)
+                            })
+                            .and_then(|devices| InputReader::open(&devices))
+                            .map_err(mlua::Error::external)?;
+                        reader = Some(opened);
+                    }
+                    let event = reader
+                        .as_mut()
+                        .expect("reader opened above")
+                        .next(timeout_ms, &cancelled_input)
+                        .map_err(mlua::Error::external)?;
+                    match event {
+                        Some(event) => {
+                            let table = lua.create_table()?;
+                            table.set("device", event.device)?;
+                            table.set("type", event.kind)?;
+                            table.set("code", event.code)?;
+                            table.set("value", event.value)?;
+                            table.set("time_ms", event.time_ms)?;
+                            Ok(mlua::Value::Table(table))
+                        }
+                        None => Ok(mlua::Value::Nil),
+                    }
                 })?,
             )?;
             api.set("input", input)?;
@@ -2704,5 +2948,111 @@ mod tests {
             runtime_api_url("192.168.1.81:8099").unwrap(),
             "http://192.168.1.81:8099"
         );
+    }
+
+    fn input_manifest(extra: &str) -> Manifest {
+        toml::from_str(&format!(
+            "id = \"p\"\nname = \"p\"\nversion = \"1\"\nentry = \"main.lua\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn decodes_64_bit_input_event() {
+        let mut bytes = vec![];
+        bytes.extend(1_700_000_000i64.to_ne_bytes());
+        bytes.extend(250_999i64.to_ne_bytes());
+        bytes.extend(1u16.to_ne_bytes());
+        bytes.extend(0x74u16.to_ne_bytes());
+        bytes.extend((-1i32).to_ne_bytes());
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(input_event_size(8), 24);
+        let event = decode_input_event("mute", &bytes, 8).unwrap();
+        assert_eq!(
+            event,
+            InputEvent {
+                device: "mute".into(),
+                kind: 1,
+                code: 0x74,
+                value: -1,
+                time_ms: 1_700_000_000_250,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_32_bit_input_event_and_rejects_wrong_length() {
+        let mut bytes = vec![];
+        bytes.extend(10i32.to_ne_bytes());
+        bytes.extend(2_000i32.to_ne_bytes());
+        bytes.extend(3u16.to_ne_bytes());
+        bytes.extend(4u16.to_ne_bytes());
+        bytes.extend(5i32.to_ne_bytes());
+        let event = decode_input_event("d", &bytes, 4).unwrap();
+        assert_eq!((event.kind, event.code, event.value), (3, 4, 5));
+        assert_eq!(event.time_ms, 10_002);
+        assert!(decode_input_event("d", &bytes[..15], 4).is_err());
+        assert!(decode_input_event("d", &bytes, 8).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_event_size_matches_libc() {
+        assert_eq!(
+            input_event_size(std::mem::size_of::<libc::c_long>()),
+            std::mem::size_of::<libc::input_event>()
+        );
+    }
+
+    const FAKE_PROC_INPUT: &str = "I: Bus=0019 Vendor=0001 Product=0001 Version=0100\n\
+N: Name=\"input_btrcu\"\n\
+H: Handlers=event0 \n\
+\n\
+I: Bus=0019 Vendor=0001 Product=0002 Version=0100\n\
+N: Name=\"vad_keypad\"\n\
+H: Handlers=kbd event1 \n\
+\n\
+I: Bus=0019 Vendor=0001 Product=0003 Version=0100\n\
+N: Name=\"mute\"\n\
+H: Handlers=event2 \n\
+\n\
+I: Bus=0019 Vendor=0001 Product=0004 Version=0100\n\
+N: Name=\"awinic_sar\"\n\
+H: Handlers=event3 \n\
+\n";
+
+    #[test]
+    fn resolves_declared_input_devices_only() {
+        let names = vec!["mute".to_string(), "awinic_sar".to_string()];
+        let devices = resolve_input_devices(FAKE_PROC_INPUT, &names).unwrap();
+        assert_eq!(
+            devices,
+            vec![
+                ("mute".to_string(), PathBuf::from("/dev/input/event2")),
+                ("awinic_sar".to_string(), PathBuf::from("/dev/input/event3")),
+            ]
+        );
+        assert!(resolve_input_devices(FAKE_PROC_INPUT, &["missing".to_string()]).is_err());
+        assert!(resolve_input_devices(FAKE_PROC_INPUT, &[]).is_err());
+        assert!(resolve_input_devices(FAKE_PROC_INPUT, &["mut".to_string()]).is_err());
+    }
+
+    #[test]
+    fn manifest_without_input_devices_is_rejected_for_events() {
+        let none = input_manifest("permissions = [\"input\"]\n");
+        assert!(input_scope(&none).is_err());
+        let declared = input_manifest(
+            "permissions = [\"input\"]\n[input]\ndevices = [\"vad_keypad\", \"mute\"]\n",
+        );
+        assert_eq!(input_scope(&declared).unwrap(), ["vad_keypad", "mute"]);
+        assert!(validate_input_policy(&declared).is_ok());
+    }
+
+    #[test]
+    fn input_devices_require_input_permission_and_valid_names() {
+        let no_permission = input_manifest("[input]\ndevices = [\"mute\"]\n");
+        assert!(validate_input_policy(&no_permission).is_err());
+        let blank = input_manifest("permissions = [\"input\"]\n[input]\ndevices = [\" \"]\n");
+        assert!(validate_input_policy(&blank).is_err());
     }
 }
