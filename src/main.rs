@@ -15,14 +15,14 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Cursor, Read},
-    net::TcpStream,
+    net::{SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{net::TcpListener, sync::Mutex, task};
 use tower_http::trace::TraceLayer;
@@ -1119,6 +1119,18 @@ fn http_request(
     Ok((status, response_body))
 }
 const QUASAR_CONFIG: &str = "/system/vendor/quasar/quasar.cfg";
+const IPC_MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
+const IPC_RECONNECT_DELAY: Duration = Duration::from_secs(1);
+const QUASAR_IPC_SERVICES: &[&str] = &[
+    "aliced",
+    "alarmd",
+    "audioclient",
+    "glagold",
+    "mediad",
+    "networkd",
+    "syncd",
+    "wifid",
+];
 /// Extract only `<service>.port` from quasar.cfg; the rest of the file holds secrets.
 fn quasar_service_port(config: &str, service: &str) -> Result<Option<u16>> {
     let value: serde_json::Value =
@@ -1323,26 +1335,29 @@ impl InputReader {
         }
     }
 }
-fn ipc_endpoint(service: &str) -> Result<String> {
-    let variable = match service {
-        "alarmd" => "YAM_ALARMD_ADDR",
-        "aliced" => "YAM_ALICED_ADDR",
-        _ => bail!("only alarmd and aliced IPC streams are available"),
-    };
-    let address = match std::env::var(variable) {
+fn ipc_endpoint(service: &str) -> Result<SocketAddr> {
+    QUASAR_IPC_SERVICES
+        .contains(&service)
+        .then_some(())
+        .context("unsupported Quasar IPC service")?;
+    let variable = format!("YAM_{}_ADDR", service.to_ascii_uppercase());
+    let address = match std::env::var(&variable) {
         Ok(address) => address,
         Err(_) => {
-            let port = std::fs::read_to_string(QUASAR_CONFIG)
-                .ok()
-                .and_then(|config| quasar_service_port(&config, service).ok().flatten())
-                .with_context(|| format!("{variable} is not configured"))?;
+            let config = std::fs::read_to_string(QUASAR_CONFIG)
+                .with_context(|| format!("read {QUASAR_CONFIG} or set {variable}"))?;
+            let port = quasar_service_port(&config, service)?
+                .with_context(|| format!("{service}.port is not configured"))?;
             format!("127.0.0.1:{port}")
         }
     };
-    address
-        .parse::<std::net::SocketAddr>()
+    let endpoint = address
+        .parse::<SocketAddr>()
         .context("invalid IPC address")?;
-    Ok(address)
+    if !endpoint.ip().is_ipv4() || !endpoint.ip().is_loopback() {
+        bail!("Quasar IPC endpoint must be an IPv4 loopback address")
+    }
+    Ok(endpoint)
 }
 fn protobuf_varint(data: &[u8], offset: &mut usize) -> Result<u64> {
     let mut value = 0u64;
@@ -1498,35 +1513,97 @@ fn decode_ipc_event(service: &str, message: &[u8]) -> Result<Option<serde_json::
         _ => bail!("unsupported IPC service"),
     }
 }
+fn ipc_frame_length(header: [u8; 4]) -> Result<usize> {
+    let length = i32::from_le_bytes(header);
+    if length < 0 {
+        bail!("IPC frame has a negative length")
+    }
+    let length = length as usize;
+    if length > IPC_MAX_FRAME_SIZE {
+        bail!("IPC frame exceeds 10 MiB")
+    }
+    Ok(length)
+}
+
+fn connect_ipc(endpoint: SocketAddr, deadline: Instant) -> Result<Option<TcpStream>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        match TcpStream::connect_timeout(&endpoint, remaining.min(IPC_RECONNECT_DELAY)) {
+            Ok(stream) => {
+                stream.set_nodelay(true)?;
+                return Ok(Some(stream));
+            }
+            Err(_) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                std::thread::sleep(remaining.min(IPC_RECONNECT_DELAY));
+            }
+        }
+    }
+}
+
 fn ipc_next(service: &str, timeout_ms: u64) -> Result<Option<serde_json::Value>> {
     if timeout_ms > 60_000 {
         bail!("IPC timeout is limited to 60 seconds")
     }
-    let address = ipc_endpoint(service)?;
-    let mut stream = TcpStream::connect_timeout(&address.parse()?, Duration::from_secs(5))?;
-    stream.set_read_timeout(Some(Duration::from_millis(timeout_ms.max(1))))?;
+    let endpoint = ipc_endpoint(service)?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
     loop {
+        let Some(mut stream) = connect_ipc(endpoint, deadline)? else {
+            return Ok(None);
+        };
         let mut header = [0u8; 4];
-        match stream.read_exact(&mut header) {
-            Ok(()) => {}
-            Err(error)
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            stream.set_read_timeout(Some(remaining))?;
+            match stream.read_exact(&mut header) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
+                    return Ok(None)
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::UnexpectedEof
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                    ) =>
+                {
+                    break
+                }
+                Err(error) => return Err(error.into()),
+            }
+            let mut payload = vec![0; ipc_frame_length(header)?];
+            if let Err(error) = stream.read_exact(&mut payload) {
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                return Ok(None)
+                    std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                ) {
+                    break;
+                }
+                return Err(error.into());
             }
-            Err(error) => return Err(error.into()),
-        }
-        let length = u32::from_le_bytes(header) as usize;
-        if length > 1_048_576 {
-            bail!("IPC message exceeds 1 MiB")
-        }
-        let mut payload = vec![0; length];
-        stream.read_exact(&mut payload)?;
-        if let Some(event) = decode_ipc_event(service, &payload)? {
-            return Ok(Some(event));
+            // A successful wire-level parse is the minimum validation for a
+            // proto2 QuasarMessage; unknown fields are intentionally retained.
+            protobuf_fields(&payload)?;
+            if let Some(event) = decode_ipc_event(service, &payload)? {
+                return Ok(Some(event));
+            }
         }
     }
 }
@@ -2951,6 +3028,16 @@ mod tests {
             decode_ipc_event("alarmd", &alarm).unwrap().unwrap()["id"],
             "a1"
         );
+    }
+
+    #[test]
+    fn ipc_frame_length_uses_signed_10_mib_bound() {
+        assert_eq!(
+            ipc_frame_length((IPC_MAX_FRAME_SIZE as i32).to_le_bytes()).unwrap(),
+            IPC_MAX_FRAME_SIZE
+        );
+        assert!(ipc_frame_length((-1i32).to_le_bytes()).is_err());
+        assert!(ipc_frame_length(((IPC_MAX_FRAME_SIZE + 1) as i32).to_le_bytes()).is_err());
     }
 
     #[test]
