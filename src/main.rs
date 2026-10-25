@@ -1553,6 +1553,28 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     }
     out.push(value as u8);
 }
+fn push_bytes(out: &mut Vec<u8>, field: u64, value: &[u8]) {
+    push_varint(out, field << 3 | 2);
+    push_varint(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+/// Sends `AliceCapabilityMethod::CANCEL_DIALOG` through the supported local
+/// remoting envelope. This is deliberately exposed only as a fixed command,
+/// rather than letting a voice-command package build arbitrary aliced control
+/// frames.
+fn cancel_alice_dialog() -> Result<()> {
+    let mut method = Vec::new();
+    push_varint(&mut method, 1 << 3);
+    push_varint(&mut method, 3); // AliceCapabilityMethod::CANCEL_DIALOG
+    let mut remoting = Vec::new();
+    push_bytes(&mut remoting, 7, b"AliceCapability");
+    push_bytes(&mut remoting, 8, &method);
+    let mut message = Vec::new();
+    push_bytes(&mut message, 252, &remoting);
+    push_varint(&mut message, 253 << 3);
+    push_varint(&mut message, 210); // QuasarMessage.remoting
+    ipc_send("aliced", &message)
+}
 fn decode_ipc_event(service: &str, message: &[u8]) -> Result<Option<serde_json::Value>> {
     let message = normalize_ipc_message(message)?;
     let message = message.as_slice();
@@ -2346,6 +2368,10 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
         }
         if permissions.contains("commands") {
             let command = lua.create_table()?;
+            command.set(
+                "cancel",
+                lua.create_function(|_, ()| cancel_alice_dialog().map_err(mlua::Error::external))?,
+            )?;
             let allowed_phrases = manifest.commands.phrases.clone();
             let command_cancelled = cancelled.clone();
             command.set(
@@ -3310,6 +3336,28 @@ mod tests {
         );
         assert!(ipc_frame_length((-1i32).to_le_bytes()).is_err());
         assert!(ipc_frame_length(((IPC_MAX_FRAME_SIZE + 1) as i32).to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn alice_cancel_uses_remoting_envelope() {
+        let mut method = Vec::new();
+        push_varint(&mut method, 1 << 3);
+        push_varint(&mut method, 3);
+        let mut remoting = Vec::new();
+        push_bytes(&mut remoting, 7, b"AliceCapability");
+        push_bytes(&mut remoting, 8, &method);
+        let mut message = Vec::new();
+        push_bytes(&mut message, 252, &remoting);
+        push_varint(&mut message, 253 << 3);
+        push_varint(&mut message, 210);
+        assert_eq!(varint_field(&message, 253).unwrap(), Some(210));
+        let remoting = nested_field(&message, 252).unwrap().unwrap();
+        assert_eq!(
+            text_field(&remoting, 7).unwrap().as_deref(),
+            Some("AliceCapability")
+        );
+        let method = nested_field(&remoting, 8).unwrap().unwrap();
+        assert_eq!(varint_field(&method, 1).unwrap(), Some(3));
     }
 
     #[test]
