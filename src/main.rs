@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fs,
-    io::{Cursor, Read},
+    io::{Cursor, Read, Write},
     net::{SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -135,6 +135,8 @@ struct Manifest {
     #[serde(default)]
     input: InputPolicy,
     #[serde(default)]
+    ipc: IpcPolicy,
+    #[serde(default)]
     compatibility: Compatibility,
     #[serde(default)]
     launch: Launch,
@@ -152,6 +154,12 @@ struct NetworkPolicy {
 struct InputPolicy {
     #[serde(default)]
     devices: Vec<String>,
+}
+/// Quasar services a package may access through the local IPC bridge.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct IpcPolicy {
+    #[serde(default)]
+    services: Vec<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Launch {
@@ -509,6 +517,7 @@ impl PluginManager {
             bail!("binary packages require the exec permission")
         }
         validate_input_policy(&m)?;
+        validate_ipc_policy(&m)?;
         if m.launch.kind == LaunchKind::Binary {
             let executable = stage.join(m.launch.path(&m));
             if !executable.is_file() {
@@ -1121,16 +1130,6 @@ fn http_request(
 const QUASAR_CONFIG: &str = "/system/vendor/quasar/quasar.cfg";
 const IPC_MAX_FRAME_SIZE: usize = 10 * 1024 * 1024;
 const IPC_RECONNECT_DELAY: Duration = Duration::from_secs(1);
-const QUASAR_IPC_SERVICES: &[&str] = &[
-    "aliced",
-    "alarmd",
-    "audioclient",
-    "glagold",
-    "mediad",
-    "networkd",
-    "syncd",
-    "wifid",
-];
 /// Extract only `<service>.port` from quasar.cfg; the rest of the file holds secrets.
 fn quasar_service_port(config: &str, service: &str) -> Result<Option<u16>> {
     let value: serde_json::Value =
@@ -1158,6 +1157,35 @@ fn validate_input_policy(m: &Manifest) -> Result<()> {
     for name in &m.input.devices {
         if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
             bail!("[input].devices contains an invalid device name")
+        }
+    }
+    Ok(())
+}
+fn validate_ipc_policy(m: &Manifest) -> Result<()> {
+    let has_raw_ipc = m
+        .permissions
+        .iter()
+        .any(|permission| matches!(permission.as_str(), "ipc.read" | "ipc.control"));
+    if m.ipc.services.is_empty() {
+        if has_raw_ipc {
+            bail!("ipc.read and ipc.control require a non-empty [ipc].services list")
+        }
+        return Ok(());
+    }
+    if !has_raw_ipc {
+        bail!("[ipc].services requires ipc.read or ipc.control permission")
+    }
+    if m.ipc.services.len() > 16 {
+        bail!("[ipc].services lists more than 16 services")
+    }
+    for service in &m.ipc.services {
+        if service.is_empty()
+            || service.len() > 64
+            || !service
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        {
+            bail!("[ipc].services contains an invalid service name")
         }
     }
     Ok(())
@@ -1336,10 +1364,13 @@ impl InputReader {
     }
 }
 fn ipc_endpoint(service: &str) -> Result<SocketAddr> {
-    QUASAR_IPC_SERVICES
-        .contains(&service)
-        .then_some(())
-        .context("unsupported Quasar IPC service")?;
+    if service.is_empty()
+        || !service
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        bail!("invalid Quasar IPC service name")
+    }
     let variable = format!("YAM_{}_ADDR", service.to_ascii_uppercase());
     let address = match std::env::var(&variable) {
         Ok(address) => address,
@@ -1525,6 +1556,47 @@ fn ipc_frame_length(header: [u8; 4]) -> Result<usize> {
     Ok(length)
 }
 
+fn validate_quasar_message(payload: &[u8]) -> Result<()> {
+    if payload.len() > IPC_MAX_FRAME_SIZE {
+        bail!("IPC frame exceeds 10 MiB")
+    }
+    protobuf_fields(payload).map(|_| ())
+}
+
+fn write_ipc_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
+    validate_quasar_message(payload)?;
+    let length = i32::try_from(payload.len()).context("IPC frame is too large")?;
+    stream.write_all(&length.to_le_bytes())?;
+    stream.write_all(payload)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_ipc_frame(stream: &mut TcpStream, deadline: Instant) -> Result<Option<Vec<u8>>> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+    stream.set_read_timeout(Some(remaining))?;
+    let mut header = [0u8; 4];
+    match stream.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    }
+    let mut payload = vec![0; ipc_frame_length(header)?];
+    stream.read_exact(&mut payload)?;
+    validate_quasar_message(&payload)?;
+    Ok(Some(payload))
+}
+
 fn connect_ipc(endpoint: SocketAddr, deadline: Instant) -> Result<Option<TcpStream>> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1545,6 +1617,53 @@ fn connect_ipc(endpoint: SocketAddr, deadline: Instant) -> Result<Option<TcpStre
             }
         }
     }
+}
+
+fn ipc_send(service: &str, payload: &[u8]) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let endpoint = ipc_endpoint(service)?;
+    let mut stream =
+        connect_ipc(endpoint, deadline)?.context("Quasar IPC service is unavailable")?;
+    write_ipc_frame(&mut stream, payload)
+}
+
+fn ipc_request(service: &str, payload: &[u8], timeout_ms: u64) -> Result<Option<Vec<u8>>> {
+    if timeout_ms > 60_000 {
+        bail!("IPC timeout is limited to 60 seconds")
+    }
+    validate_quasar_message(payload)?;
+    let request_id =
+        nested_field(payload, 1)?.context("IPC request must include field 1 request_id")?;
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let endpoint = ipc_endpoint(service)?;
+    let mut stream =
+        connect_ipc(endpoint, deadline)?.context("Quasar IPC service is unavailable")?;
+    write_ipc_frame(&mut stream, payload)?;
+    while let Some(response) = read_ipc_frame(&mut stream, deadline)? {
+        if nested_field(&response, 1)?.as_deref() == Some(request_id.as_slice()) {
+            return Ok(Some(response));
+        }
+    }
+    Ok(None)
+}
+
+fn ipc_receive(service: &str, timeout_ms: u64) -> Result<Option<Vec<u8>>> {
+    if timeout_ms > 60_000 {
+        bail!("IPC timeout is limited to 60 seconds")
+    }
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+    let endpoint = ipc_endpoint(service)?;
+    let Some(mut stream) = connect_ipc(endpoint, deadline)? else {
+        return Ok(None);
+    };
+    read_ipc_frame(&mut stream, deadline)
+}
+
+fn ipc_service_allowed(services: &[String], service: &str) -> Result<()> {
+    if !services.iter().any(|allowed| allowed == service) {
+        bail!("Quasar IPC service is not allowed by [ipc].services")
+    }
+    Ok(())
 }
 
 fn ipc_next(service: &str, timeout_ms: u64) -> Result<Option<serde_json::Value>> {
@@ -2089,7 +2208,11 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
             )?;
             api.set("http", http)?;
         }
-        if permissions.contains("ipc.alarm") || permissions.contains("ipc.speech") {
+        if permissions.contains("ipc.alarm")
+            || permissions.contains("ipc.speech")
+            || permissions.contains("ipc.read")
+            || permissions.contains("ipc.control")
+        {
             let ipc = lua.create_table()?;
             if permissions.contains("ipc.alarm") {
                 ipc.set(
@@ -2111,6 +2234,56 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                             None => Ok(mlua::Value::Nil),
                         }
                     })?,
+                )?;
+            }
+            if permissions.contains("ipc.read") || permissions.contains("ipc.control") {
+                if manifest.ipc.services.is_empty() {
+                    bail!("ipc.read and ipc.control require a non-empty [ipc].services list")
+                }
+            }
+            if permissions.contains("ipc.read") {
+                let read_services = manifest.ipc.services.clone();
+                ipc.set(
+                    "next",
+                    lua.create_function(move |lua, (service, timeout_ms): (String, u64)| {
+                        ipc_service_allowed(&read_services, &service)
+                            .and_then(|_| ipc_receive(&service, timeout_ms))
+                            .map_err(mlua::Error::external)?
+                            .map(|payload| lua.create_string(&payload))
+                            .transpose()?
+                            .map(mlua::Value::String)
+                            .map_or(Ok(mlua::Value::Nil), Ok)
+                    })?,
+                )?;
+            }
+            if permissions.contains("ipc.control") {
+                let control_services = manifest.ipc.services.clone();
+                ipc.set(
+                    "send",
+                    lua.create_function(move |_, (service, payload): (String, mlua::String)| {
+                        ipc_service_allowed(&control_services, &service)
+                            .and_then(|_| ipc_send(&service, payload.as_bytes().as_ref()))
+                            .map_err(mlua::Error::external)
+                    })?,
+                )?;
+            }
+            if permissions.contains("ipc.read") && permissions.contains("ipc.control") {
+                let request_services = manifest.ipc.services.clone();
+                ipc.set(
+                    "request",
+                    lua.create_function(
+                        move |lua, (service, payload, timeout_ms): (String, mlua::String, u64)| {
+                            ipc_service_allowed(&request_services, &service)
+                                .and_then(|_| {
+                                    ipc_request(&service, payload.as_bytes().as_ref(), timeout_ms)
+                                })
+                                .map_err(mlua::Error::external)?
+                                .map(|response| lua.create_string(&response))
+                                .transpose()?
+                                .map(mlua::Value::String)
+                                .map_or(Ok(mlua::Value::Nil), Ok)
+                        },
+                    )?,
                 )?;
             }
             api.set("ipc", ipc)?;

@@ -16,10 +16,14 @@ Lua-пакет получает `alice`, `device` и `event`. Укажите м�
 | `network` | `alice.http.get(url)`, `post(url, body)` |
 | `ipc.alarm` | `alice.ipc.next_alarm(timeout_ms)` |
 | `ipc.speech` | `alice.ipc.next_speech(timeout_ms)` |
+| `ipc.read` | `alice.ipc.next(service, timeout_ms)` |
+| `ipc.control` | `alice.ipc.send(service, message)`; вместе с `ipc.read` — `request(service, message, timeout_ms)` |
 | `system` | `alice.system.hostname()`, `uptime()`, `meminfo()` |
 | `exec` | `alice.exec(program, args)` |
 
 `alice.sleep(ms)` доступен всем пакетам и нужен в циклах для отмены запуска.
+Низкоуровневый формат и процессы-владельцы потоков описаны в
+[Local Quasar IPC](IPC_PROTOCOL.md).
 
 ## Совместимость и сеть
 
@@ -46,3 +50,13 @@ devices = ["mute", "vad_keypad"]
 ```
 
 Функция возвращает `nil` по тайм-ауту либо `{ device, type, code, value, time_ms }`. `alice.ipc.next_alarm` и `next_speech` возвращают `nil` либо событие будильника/распознанной речи. Текст речи — персональные данные: не отправляйте его без явной необходимости и permission `network`.
+
+Для raw Quasar IPC перечислите сервисы в `[ipc].services`. `next` возвращает бинарную строку с protobuf `QuasarMessage`; `send` принимает такую строку. `request` требует `request_id` (field 1) в сообщении и ждёт ответ с тем же ID.
+
+```toml
+permissions = ["ipc.read", "ipc.control"]
+[ipc]
+services = ["mediad"]
+```
+
+`ipc.control` может менять состояние системных сервисов. Выдавайте его только доверенным пакетам и только необходимым сервисам.
