@@ -18,6 +18,7 @@ Lua-пакет получает `alice`, `device` и `event`. Укажите м�
 | `ipc.speech` | `alice.ipc.next_speech(timeout_ms)` |
 | `ipc.read` | `alice.ipc.next(service, timeout_ms)` |
 | `ipc.control` | `alice.ipc.send(service, message)`; вместе с `ipc.read` — `request(service, message, timeout_ms)` |
+| `commands` | `alice.command.listen(phrase, handler)` |
 | `system` | `alice.system.hostname()`, `uptime()`, `meminfo()` |
 | `exec` | `alice.exec(program, args)` |
 
@@ -60,3 +61,26 @@ services = ["mediad"]
 ```
 
 `ipc.control` может менять состояние системных сервисов. Выдавайте его только доверенным пакетам и только необходимым сервисам.
+
+## Голосовые команды
+
+Сервисный Lua-пакет может обработать распознанную фразу без raw protobuf. Объявите разрешённые фразы в манифесте:
+
+```toml
+permissions = ["commands"]
+
+[commands]
+phrases = ["ананас"]
+```
+
+```lua
+alice.command.listen("ананас", function(message)
+  -- «алиса ананас» и «ананас» совпадут с этой командой.
+  alice.set({"#FFFF00", "#FFFF00", "#FFFF00"})
+  -- message.transcript — исходная распознанная фраза.
+  -- message.command — нормализованная объявленная команда.
+  -- message.source — "voice" или "command".
+end)
+```
+
+`listen` работает, пока пакет запущен; используйте его в service-пакете. Фразы сравниваются без учёта регистра, повторных пробелов и пунктуации. Обработчик получает только совпавшие фразы.

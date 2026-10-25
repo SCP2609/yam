@@ -137,6 +137,8 @@ struct Manifest {
     #[serde(default)]
     ipc: IpcPolicy,
     #[serde(default)]
+    commands: CommandPolicy,
+    #[serde(default)]
     compatibility: Compatibility,
     #[serde(default)]
     launch: Launch,
@@ -160,6 +162,12 @@ struct InputPolicy {
 struct IpcPolicy {
     #[serde(default)]
     services: Vec<String>,
+}
+/// Voice commands a package may receive from aliced.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct CommandPolicy {
+    #[serde(default)]
+    phrases: Vec<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Launch {
@@ -518,6 +526,7 @@ impl PluginManager {
         }
         validate_input_policy(&m)?;
         validate_ipc_policy(&m)?;
+        validate_command_policy(&m)?;
         if m.launch.kind == LaunchKind::Binary {
             let executable = stage.join(m.launch.path(&m));
             if !executable.is_file() {
@@ -1189,6 +1198,53 @@ fn validate_ipc_policy(m: &Manifest) -> Result<()> {
         }
     }
     Ok(())
+}
+fn normalize_command(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_alphanumeric() {
+                character.to_lowercase().to_string()
+            } else {
+                " ".into()
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+fn validate_command_policy(m: &Manifest) -> Result<()> {
+    let has_commands = m
+        .permissions
+        .iter()
+        .any(|permission| permission == "commands");
+    if m.commands.phrases.is_empty() {
+        if has_commands {
+            bail!("commands permission requires a non-empty [commands].phrases list")
+        }
+        return Ok(());
+    }
+    if !has_commands {
+        bail!("[commands].phrases requires the commands permission")
+    }
+    if m.commands.phrases.len() > 32 {
+        bail!("[commands].phrases lists more than 32 phrases")
+    }
+    for phrase in &m.commands.phrases {
+        if phrase.len() > 128 || normalize_command(phrase).is_empty() {
+            bail!("[commands].phrases contains an invalid phrase")
+        }
+    }
+    Ok(())
+}
+fn command_matches(trigger: &str, transcript: &str) -> bool {
+    let trigger = normalize_command(trigger);
+    let transcript = normalize_command(transcript);
+    transcript == trigger
+        || transcript
+            .strip_prefix("алиса ")
+            .is_some_and(|phrase| phrase == trigger)
 }
 /// The device names a package declared; packages without a list get no input devices.
 fn input_scope(m: &Manifest) -> Result<&[String]> {
@@ -2288,6 +2344,49 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
             }
             api.set("ipc", ipc)?;
         }
+        if permissions.contains("commands") {
+            let command = lua.create_table()?;
+            let allowed_phrases = manifest.commands.phrases.clone();
+            let command_cancelled = cancelled.clone();
+            command.set(
+                "listen",
+                lua.create_function(
+                    move |lua, (phrase, handler): (String, mlua::Function)| -> mlua::Result<()> {
+                        if !allowed_phrases
+                            .iter()
+                            .any(|allowed| normalize_command(allowed) == normalize_command(&phrase))
+                        {
+                            return Err(mlua::Error::external(
+                                "voice command is not declared in [commands].phrases",
+                            ));
+                        }
+                        loop {
+                            if command_cancelled.load(Ordering::Relaxed) {
+                                return Err(mlua::Error::external("plugin stopped"));
+                            }
+                            let Some(event) =
+                                ipc_next("aliced", 1_000).map_err(mlua::Error::external)?
+                            else {
+                                continue;
+                            };
+                            let Some(transcript) = event["transcript"].as_str() else {
+                                continue;
+                            };
+                            if !command_matches(&phrase, transcript) {
+                                continue;
+                            }
+                            let command_event = lua.create_table()?;
+                            command_event.set("transcript", transcript)?;
+                            command_event.set("command", normalize_command(&phrase))?;
+                            command_event
+                                .set("source", event["source"].as_str().unwrap_or("voice"))?;
+                            handler.call::<()>(command_event)?;
+                        }
+                    },
+                )?,
+            )?;
+            api.set("command", command)?;
+        }
         if permissions.contains("system") {
             let system = lua.create_table()?;
             system.set(
@@ -3211,6 +3310,13 @@ mod tests {
         );
         assert!(ipc_frame_length((-1i32).to_le_bytes()).is_err());
         assert!(ipc_frame_length(((IPC_MAX_FRAME_SIZE + 1) as i32).to_le_bytes()).is_err());
+    }
+
+    #[test]
+    fn voice_command_matches_alice_prefix_and_normalizes_text() {
+        assert!(command_matches("ананас", "Алиса, ананас!"));
+        assert!(command_matches("ананас", "ананас"));
+        assert!(!command_matches("ананас", "алиса банан"));
     }
 
     #[test]
