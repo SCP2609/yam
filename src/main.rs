@@ -2525,6 +2525,11 @@ async fn run_binary(
             }
             None => Command::new(program),
         };
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         let mut child = command
             .args(&manifest.launch.args)
             .args(invocation_args)
@@ -2542,8 +2547,7 @@ async fn run_binary(
         ];
         loop {
             if cancelled.load(Ordering::Relaxed) {
-                let _ = child.kill();
-                let _ = child.wait();
+                stop_process_group(&mut child);
                 return Ok(());
             }
             if let Some(status) = child.try_wait()? {
@@ -2564,6 +2568,26 @@ async fn run_binary(
     .await?;
     app.runtime_tokens.lock().await.remove(&id);
     result
+}
+
+/// A binary package runs as the leader of its own process group, so stopping it
+/// also reaches helpers it started (`aplay`, `arecord`, shell pipelines) instead of
+/// leaving them orphaned. The group gets SIGTERM first to let the package clean up.
+fn stop_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let group = -(child.id() as libc::pid_t);
+        unsafe { libc::kill(group, libc::SIGTERM) };
+        for _ in 0..40 {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        unsafe { libc::kill(group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // Packages converted before `launch.interpreter` / `launch.library_paths`
