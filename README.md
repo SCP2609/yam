@@ -10,7 +10,7 @@ curl -fsSL https://hackalice.me/install.sh | sh
 Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/nyakokitsu/yam/main/install.ps1 | iex
+irm https://hackalice.me/install.ps1 | iex
 ```
 
 Установщик сам найдет рабочую колонку и установит через adb на нее `yamd`
