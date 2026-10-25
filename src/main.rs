@@ -2923,7 +2923,7 @@ async fn main() -> Result<()> {
             .route("/api/led/off", post(led_off));
     }
     let router = router
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(67 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(app);
     let l = TcpListener::bind(&args.listen).await?;

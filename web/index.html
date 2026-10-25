@@ -84,7 +84,7 @@ uploadForm.onsubmit = async event => {
   event.preventDefault();
   const file = packageFile.files[0];
   if (!file) return;
-  if (file.size > 64 * 1024 * 1024) return alert('Пакет больше 64 МиБ');
+  if (file.size > 67 * 1024 * 1024) return alert('Пакет больше 67 МиБ');
   uploadStatus.textContent = `Загрузка ${file.name}…`;
   try { const form = new FormData(); form.append('package', file, file.name); await request('/plugins', { method: 'POST', body: form }); uploadForm.reset(); await load(); uploadStatus.textContent = 'Установлено. Включите пакет перед запуском.'; } catch (error) { uploadStatus.textContent = ''; alert(error.message); }
 };
