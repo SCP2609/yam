@@ -50,7 +50,7 @@ tar -C package-source -czf my-package.yap plugin.toml main.lua assets/
 
 | Permission | API | Требование |
 | --- | --- | --- |
-| `led` | `alice.set(colors)`, `alice.off()`, `alice.play(path)` | RGB LED-профиль |
+| `led` | `alice.set(colors)`, `alice.off()`, `alice.play(path)`; при `led.logo.rgb` ещё `alice.logo.set(colors)`, `alice.logo.off()` | RGB LED-профиль, `led.logo.rgb` для logo |
 | `volume` | `alice.volume.set(percent)`, `alice.volume.get()` | `audio.volume.alsa` |
 | `audio` | `alice.audio.play(relative_path)` | `audio.play.aplay` |
 | `bluetooth` | `alice.bluetooth.status()`, `power(bool)`, `scan(bool)`, `pair(mac)`, `connect(mac)`, `disconnect(mac)`, `remove(mac)` | `bluetooth.bluez` |
@@ -66,6 +66,8 @@ tar -C package-source -czf my-package.yap plugin.toml main.lua assets/
 | `exec` | `alice.exec(program, args)` | runtime-настройка `allow_plugin_binaries = true` |
 
 `alice.set` принимает ровно `device.led_count` строк формата `#RRGGBB`. `alice.sleep(ms)` доступен любому пакету без отдельного permission, принимает 0–60000 мс и является точкой отмены.
+
+`alice.logo.set` (только Станция Миди, фича `led.logo.rgb`) принимает ровно 6 строк `#RRGGBB` по числу logo-LED. Запись снимает триггер `ledfb-logo`; `alice.logo.off()` возвращает его. Если плагин менял logo, остановка плагина тоже возвращает триггер.
 
 ### HTTP(S)
 

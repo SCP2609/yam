@@ -252,6 +252,8 @@ struct App {
 #[derive(Clone)]
 struct Led {
     settings: Arc<Mutex<LedSettings>>,
+    /// Set once the logo LEDs were written, so stopping a plugin can release them.
+    logo_touched: Arc<AtomicBool>,
 }
 #[derive(Deserialize)]
 struct Frame {
@@ -279,6 +281,48 @@ impl Led {
             self.write(&c, "red", i, r).await?;
             self.write(&c, "green", i, g).await?;
             self.write(&c, "blue", i, b).await?;
+        }
+        Ok(())
+    }
+    async fn logo_set(&self, colors: Vec<String>) -> Result<()> {
+        if colors.len() != LOGO_COUNT {
+            bail!("expected {LOGO_COUNT} colors, got {}", colors.len())
+        }
+        let root = self.settings.lock().await.sysfs_root.clone();
+        if !logo_available(&root) {
+            bail!("logo LEDs are not available on this device")
+        }
+        // Validate every color before touching the hardware.
+        let parsed = colors
+            .iter()
+            .map(|hex| parse_color(hex))
+            .collect::<Result<Vec<_>>>()?;
+        self.logo_touched.store(true, Ordering::Relaxed);
+        for (i, (r, g, b)) in parsed.into_iter().enumerate() {
+            for (channel, value) in [("red", r), ("green", g), ("blue", b)] {
+                let path = logo_brightness_path(&root, channel, i);
+                fs::write(&path, value.to_string())
+                    .with_context(|| format!("write {}", path.display()))?;
+            }
+        }
+        Ok(())
+    }
+    // Writing brightness detaches the `ledfb-logo` trigger used by platformd.
+    async fn logo_off(&self) -> Result<()> {
+        let root = self.settings.lock().await.sysfs_root.clone();
+        if !logo_available(&root) {
+            bail!("logo LEDs are not available on this device")
+        }
+        self.logo_touched.store(false, Ordering::Relaxed);
+        for i in 0..LOGO_COUNT {
+            for channel in ["red", "green", "blue"] {
+                let brightness = logo_brightness_path(&root, channel, i);
+                fs::write(&brightness, "0")
+                    .with_context(|| format!("write {}", brightness.display()))?;
+                let trigger = brightness.with_file_name("trigger");
+                fs::write(&trigger, "ledfb-logo")
+                    .with_context(|| format!("restore trigger {}", trigger.display()))?;
+            }
         }
         Ok(())
     }
@@ -333,6 +377,18 @@ impl Led {
         }
         Ok(())
     }
+}
+const LOGO_COUNT: usize = 6;
+fn logo_brightness_path(sysfs_root: &str, channel: &str, index: usize) -> PathBuf {
+    PathBuf::from(sysfs_root).join(format!("cucumber:{channel}:logo{index}/brightness"))
+}
+/// True when all 18 Midi logo channels exist in sysfs.
+fn logo_available(sysfs_root: &str) -> bool {
+    (0..LOGO_COUNT).all(|i| {
+        ["red", "green", "blue"]
+            .iter()
+            .all(|channel| logo_brightness_path(sysfs_root, channel, i).exists())
+    })
 }
 /// Known sysfs ring layouts: (profile, LED name prefix, first index, LED count).
 const LED_PROFILES: [(&str, &str, usize, usize); 4] = [
@@ -1431,6 +1487,35 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                         .map_err(mlua::Error::external)
                 })?,
             )?;
+            if device.features.iter().any(|f| f == "led.logo.rgb") {
+                let logo = lua.create_table()?;
+                let logo_set = led.clone();
+                let cancelled_logo = cancelled.clone();
+                logo.set(
+                    "set",
+                    lua.create_function(move |_, colors: mlua::Table| {
+                        if cancelled_logo.load(Ordering::Relaxed) {
+                            return Err(mlua::Error::external("plugin stopped"));
+                        }
+                        let v = colors
+                            .sequence_values::<String>()
+                            .collect::<mlua::Result<Vec<_>>>()?;
+                        tokio::runtime::Handle::current()
+                            .block_on(logo_set.logo_set(v))
+                            .map_err(mlua::Error::external)
+                    })?,
+                )?;
+                let logo_off = led.clone();
+                logo.set(
+                    "off",
+                    lua.create_function(move |_, ()| {
+                        tokio::runtime::Handle::current()
+                            .block_on(logo_off.logo_off())
+                            .map_err(mlua::Error::external)
+                    })?,
+                )?;
+                api.set("logo", logo)?;
+            }
             let pattern_root = root.clone();
             let cancelled_play = cancelled.clone();
             api.set(
@@ -2200,6 +2285,9 @@ async fn stop_plugin(
     drop(plugins);
     if uses_led {
         let _ = a.led.off().await;
+        if a.led.logo_touched.load(Ordering::Relaxed) {
+            let _ = a.led.logo_off().await;
+        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2255,6 +2343,25 @@ async fn runtime_led(
 ) -> Result<StatusCode, ApiError> {
     runtime_permission(&a, &id, &headers, "led").await?;
     a.led.draw(frame.colors).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn runtime_logo(
+    State(a): State<App>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(frame): Json<Frame>,
+) -> Result<StatusCode, ApiError> {
+    runtime_permission(&a, &id, &headers, "led").await?;
+    a.led.logo_set(frame.colors).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn runtime_logo_off(
+    State(a): State<App>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    runtime_permission(&a, &id, &headers, "led").await?;
+    a.led.logo_off().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn runtime_led_off(
@@ -2349,6 +2456,14 @@ async fn led_set(State(a): State<App>, Json(f): Json<Frame>) -> Result<StatusCod
 }
 async fn led_off(State(a): State<App>) -> Result<StatusCode, ApiError> {
     a.led.off().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn logo_set(State(a): State<App>, Json(f): Json<Frame>) -> Result<StatusCode, ApiError> {
+    a.led.logo_set(f.colors).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+async fn logo_off(State(a): State<App>) -> Result<StatusCode, ApiError> {
+    a.led.logo_off().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 #[derive(Debug)]
@@ -2501,6 +2616,7 @@ async fn main() -> Result<()> {
     };
     let led = Arc::new(Led {
         settings: Arc::new(Mutex::new(settings.led.clone())),
+        logo_touched: Arc::new(AtomicBool::new(false)),
     });
     let mut device = detect_device(&args.data_dir, args.model);
     let led_features = if configured_rgb_ring(&settings.led) {
@@ -2515,6 +2631,12 @@ async fn main() -> Result<()> {
         vec![]
     };
     for feature in led_features {
+        if !device.features.contains(&feature) {
+            device.features.push(feature);
+        }
+    }
+    if logo_available(&settings.led.sysfs_root) {
+        let feature = "led.logo.rgb".to_string();
         if !device.features.contains(&feature) {
             device.features.push(feature);
         }
@@ -2575,13 +2697,17 @@ async fn main() -> Result<()> {
             .route("/api/runtime/:id/sensors", get(runtime_sensors))
             .route("/api/runtime/:id/led", post(runtime_led))
             .route("/api/runtime/:id/led/off", post(runtime_led_off))
+            .route("/api/runtime/:id/logo", post(runtime_logo))
+            .route("/api/runtime/:id/logo/off", post(runtime_logo_off))
             .route("/api/runtime/:id/clock", post(runtime_clock))
             .route("/api/settings", get(get_settings).put(put_settings))
             .route("/api/device", get(get_device).put(put_device))
             .route("/api/sensors", get(get_sensors))
             .route("/api/clock", get(get_clock).put(put_clock))
             .route("/api/led", post(led_set))
-            .route("/api/led/off", post(led_off));
+            .route("/api/led/off", post(led_off))
+            .route("/api/logo", post(logo_set))
+            .route("/api/logo/off", post(logo_off));
     }
     let router = router
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -2597,6 +2723,43 @@ const UI: &str = include_str!("../web/index.html");
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builds_logo_paths() {
+        assert_eq!(
+            logo_brightness_path("/sys/class/leds", "green", 5),
+            Path::new("/sys/class/leds/cucumber:green:logo5/brightness")
+        );
+    }
+
+    #[test]
+    fn logo_needs_all_eighteen_leds() {
+        let root = std::env::temp_dir().join(format!("yam-logo-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let root_str = root.to_str().unwrap();
+        assert!(!logo_available(root_str));
+        for i in 0..LOGO_COUNT {
+            for channel in ["red", "green", "blue"] {
+                let path = logo_brightness_path(root_str, channel, i);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(&path, "0").unwrap();
+            }
+        }
+        assert!(logo_available(root_str));
+        fs::remove_file(logo_brightness_path(root_str, "blue", 3)).unwrap();
+        assert!(!logo_available(root_str));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn logo_rejects_wrong_color_count() {
+        let led = Led {
+            settings: Arc::new(Mutex::new(Settings::default().led)),
+            logo_touched: Arc::new(AtomicBool::new(false)),
+        };
+        let error = led.logo_set(vec!["#000000".into(); 5]).await.unwrap_err();
+        assert!(error.to_string().contains("expected 6 colors, got 5"));
+    }
 
     #[test]
     fn decodes_recognized_phrase() {

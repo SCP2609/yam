@@ -73,6 +73,11 @@ enum Command {
         #[command(subcommand)]
         command: LedCommand,
     },
+    /// Yandex Station Midi logo LEDs (`yam logo set` takes 6 colors).
+    Logo {
+        #[command(subcommand)]
+        command: LedCommand,
+    },
 }
 
 #[derive(Subcommand)]
@@ -241,6 +246,17 @@ fn main() -> Result<()> {
             )?,
             LedCommand::Off => {
                 print_response(client.post(endpoint(&cli.url, "/api/led/off")).send()?)?
+            }
+        },
+        Command::Logo { command } => match command {
+            LedCommand::Set { colors } => print_response(
+                client
+                    .post(endpoint(&cli.url, "/api/logo"))
+                    .json(&serde_json::json!({"colors":colors}))
+                    .send()?,
+            )?,
+            LedCommand::Off => {
+                print_response(client.post(endpoint(&cli.url, "/api/logo/off")).send()?)?
             }
         },
     }
