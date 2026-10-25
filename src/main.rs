@@ -133,6 +133,8 @@ struct Manifest {
     #[serde(default)]
     network: NetworkPolicy,
     #[serde(default)]
+    input: InputPolicy,
+    #[serde(default)]
     compatibility: Compatibility,
     #[serde(default)]
     launch: Launch,
@@ -144,6 +146,12 @@ struct NetworkPolicy {
     allow: Vec<String>,
     #[serde(default)]
     allow_insecure_http: bool,
+}
+/// Input devices a package may read through `alice.input.next_event`, by kernel device name.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct InputPolicy {
+    #[serde(default)]
+    devices: Vec<String>,
 }
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct Launch {
@@ -252,8 +260,6 @@ struct App {
 #[derive(Clone)]
 struct Led {
     settings: Arc<Mutex<LedSettings>>,
-    /// Set once the logo LEDs were written, so stopping a plugin can release them.
-    logo_touched: Arc<AtomicBool>,
 }
 #[derive(Deserialize)]
 struct Frame {
@@ -281,48 +287,6 @@ impl Led {
             self.write(&c, "red", i, r).await?;
             self.write(&c, "green", i, g).await?;
             self.write(&c, "blue", i, b).await?;
-        }
-        Ok(())
-    }
-    async fn logo_set(&self, colors: Vec<String>) -> Result<()> {
-        if colors.len() != LOGO_COUNT {
-            bail!("expected {LOGO_COUNT} colors, got {}", colors.len())
-        }
-        let root = self.settings.lock().await.sysfs_root.clone();
-        if !logo_available(&root) {
-            bail!("logo LEDs are not available on this device")
-        }
-        // Validate every color before touching the hardware.
-        let parsed = colors
-            .iter()
-            .map(|hex| parse_color(hex))
-            .collect::<Result<Vec<_>>>()?;
-        self.logo_touched.store(true, Ordering::Relaxed);
-        for (i, (r, g, b)) in parsed.into_iter().enumerate() {
-            for (channel, value) in [("red", r), ("green", g), ("blue", b)] {
-                let path = logo_brightness_path(&root, channel, i);
-                fs::write(&path, value.to_string())
-                    .with_context(|| format!("write {}", path.display()))?;
-            }
-        }
-        Ok(())
-    }
-    // Writing brightness detaches the `ledfb-logo` trigger used by platformd.
-    async fn logo_off(&self) -> Result<()> {
-        let root = self.settings.lock().await.sysfs_root.clone();
-        if !logo_available(&root) {
-            bail!("logo LEDs are not available on this device")
-        }
-        self.logo_touched.store(false, Ordering::Relaxed);
-        for i in 0..LOGO_COUNT {
-            for channel in ["red", "green", "blue"] {
-                let brightness = logo_brightness_path(&root, channel, i);
-                fs::write(&brightness, "0")
-                    .with_context(|| format!("write {}", brightness.display()))?;
-                let trigger = brightness.with_file_name("trigger");
-                fs::write(&trigger, "ledfb-logo")
-                    .with_context(|| format!("restore trigger {}", trigger.display()))?;
-            }
         }
         Ok(())
     }
@@ -377,18 +341,6 @@ impl Led {
         }
         Ok(())
     }
-}
-const LOGO_COUNT: usize = 6;
-fn logo_brightness_path(sysfs_root: &str, channel: &str, index: usize) -> PathBuf {
-    PathBuf::from(sysfs_root).join(format!("cucumber:{channel}:logo{index}/brightness"))
-}
-/// True when all 18 Midi logo channels exist in sysfs.
-fn logo_available(sysfs_root: &str) -> bool {
-    (0..LOGO_COUNT).all(|i| {
-        ["red", "green", "blue"]
-            .iter()
-            .all(|channel| logo_brightness_path(sysfs_root, channel, i).exists())
-    })
 }
 /// Known sysfs ring layouts: (profile, LED name prefix, first index, LED count).
 const LED_PROFILES: [(&str, &str, usize, usize); 4] = [
@@ -556,6 +508,7 @@ impl PluginManager {
         if m.launch.kind == LaunchKind::Binary && !m.permissions.iter().any(|p| p == "exec") {
             bail!("binary packages require the exec permission")
         }
+        validate_input_policy(&m)?;
         if m.launch.kind == LaunchKind::Binary {
             let executable = stage.join(m.launch.path(&m));
             if !executable.is_file() {
@@ -1176,6 +1129,200 @@ fn quasar_service_port(config: &str, service: &str) -> Result<Option<u16>> {
         .and_then(serde_json::Value::as_u64)
         .and_then(|port| u16::try_from(port).ok()))
 }
+const EV_SYN: u16 = 0;
+/// Longest single `poll` wait, so a stopped plugin is noticed within about this long.
+const INPUT_POLL_SLICE_MS: u64 = 100;
+
+fn validate_input_policy(m: &Manifest) -> Result<()> {
+    if m.input.devices.is_empty() {
+        return Ok(());
+    }
+    if !m.permissions.iter().any(|p| p == "input") {
+        bail!("[input].devices requires the input permission")
+    }
+    if m.input.devices.len() > 16 {
+        bail!("[input].devices lists more than 16 devices")
+    }
+    for name in &m.input.devices {
+        if name.trim().is_empty() || name.len() > 128 || name.chars().any(char::is_control) {
+            bail!("[input].devices contains an invalid device name")
+        }
+    }
+    Ok(())
+}
+/// The device names a package declared; packages without a list get no input devices.
+fn input_scope(m: &Manifest) -> Result<&[String]> {
+    if m.input.devices.is_empty() {
+        bail!("alice.input.next_event requires a non-empty [input].devices manifest list")
+    }
+    Ok(&m.input.devices)
+}
+/// Maps declared device names to `/dev/input/eventN` using `/proc/bus/input/devices` text.
+/// Only exact name matches are returned; every declared name must exist.
+fn resolve_input_devices(proc_devices: &str, wanted: &[String]) -> Result<Vec<(String, PathBuf)>> {
+    if wanted.is_empty() {
+        bail!("no input devices declared")
+    }
+    let mut available = vec![];
+    for block in proc_devices.split("\n\n") {
+        let mut name = None;
+        let mut event = None;
+        for line in block.lines() {
+            if let Some(value) = line.strip_prefix("N: Name=") {
+                name = Some(value.trim().trim_matches('"').to_string());
+            } else if let Some(handlers) = line.strip_prefix("H: Handlers=") {
+                event = handlers.split_whitespace().find(|handler| {
+                    handler
+                        .strip_prefix("event")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                });
+            }
+        }
+        if let (Some(name), Some(event)) = (name, event) {
+            available.push((name, PathBuf::from("/dev/input").join(event)));
+        }
+    }
+    let mut resolved = vec![];
+    for name in wanted {
+        let before = resolved.len();
+        for (candidate, path) in &available {
+            if candidate == name {
+                resolved.push((name.clone(), path.clone()));
+            }
+        }
+        if resolved.len() == before {
+            bail!("input device {name:?} not found")
+        }
+    }
+    Ok(resolved)
+}
+#[derive(Debug, Clone, PartialEq)]
+struct InputEvent {
+    device: String,
+    kind: u16,
+    code: u16,
+    value: i32,
+    time_ms: i64,
+}
+/// Size of the kernel `struct input_event`: two `long` timestamp words plus type, code, value.
+fn input_event_size(word: usize) -> usize {
+    word * 2 + 8
+}
+fn read_input_word(bytes: &[u8], word: usize) -> i64 {
+    match word {
+        4 => i32::from_ne_bytes(bytes[..4].try_into().unwrap()) as i64,
+        _ => i64::from_ne_bytes(bytes[..8].try_into().unwrap()),
+    }
+}
+/// Decodes one native-endian `struct input_event` whose timestamp words are `word` bytes wide.
+fn decode_input_event(device: &str, bytes: &[u8], word: usize) -> Result<InputEvent> {
+    if !matches!(word, 4 | 8) || bytes.len() != input_event_size(word) {
+        bail!("malformed input_event record")
+    }
+    let seconds = read_input_word(bytes, word);
+    let micros = read_input_word(&bytes[word..], word);
+    let tail = &bytes[word * 2..];
+    Ok(InputEvent {
+        device: device.to_string(),
+        kind: u16::from_ne_bytes([tail[0], tail[1]]),
+        code: u16::from_ne_bytes([tail[2], tail[3]]),
+        value: i32::from_ne_bytes([tail[4], tail[5], tail[6], tail[7]]),
+        time_ms: seconds * 1000 + micros / 1000,
+    })
+}
+struct InputSource {
+    name: String,
+    file: fs::File,
+}
+/// Read-only, non-grabbing evdev reader over the devices a package declared.
+struct InputReader {
+    sources: Vec<InputSource>,
+    pending: std::collections::VecDeque<InputEvent>,
+}
+impl InputReader {
+    fn open(devices: &[(String, PathBuf)]) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut sources = vec![];
+        for (name, path) in devices {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(path)
+                .with_context(|| format!("open input device {name:?} at {}", path.display()))?;
+            sources.push(InputSource {
+                name: name.clone(),
+                file,
+            });
+        }
+        Ok(Self {
+            sources,
+            pending: Default::default(),
+        })
+    }
+    /// Waits up to `timeout_ms` for the next non-`EV_SYN` event, checking `cancelled` between
+    /// `INPUT_POLL_SLICE_MS` waits.
+    fn next(&mut self, timeout_ms: u64, cancelled: &AtomicBool) -> Result<Option<InputEvent>> {
+        use std::os::unix::io::AsRawFd;
+        let word = std::mem::size_of::<libc::c_long>();
+        let size = input_event_size(word);
+        let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+        let mut buffer = vec![0u8; size * 32];
+        loop {
+            if cancelled.load(Ordering::Relaxed) {
+                bail!("plugin stopped")
+            }
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let wait = (remaining.as_millis() as u64).min(INPUT_POLL_SLICE_MS);
+            let mut fds: Vec<libc::pollfd> = self
+                .sources
+                .iter()
+                .map(|source| libc::pollfd {
+                    fd: source.file.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            let ready =
+                unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, wait as i32) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error).context("poll input devices");
+                }
+            } else if ready > 0 {
+                for (source, fd) in self.sources.iter_mut().zip(&fds) {
+                    if fd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                        bail!("input device {:?} is no longer available", source.name)
+                    }
+                    if fd.revents & libc::POLLIN == 0 {
+                        continue;
+                    }
+                    let length = match source.file.read(&mut buffer) {
+                        Ok(length) => length,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(error) => {
+                            return Err(error)
+                                .with_context(|| format!("read input device {:?}", source.name))
+                        }
+                    };
+                    for record in buffer[..length - length % size].chunks_exact(size) {
+                        let event = decode_input_event(&source.name, record, word)?;
+                        if event.kind != EV_SYN {
+                            self.pending.push_back(event);
+                        }
+                    }
+                }
+            }
+            if self.pending.is_empty() && std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+        }
+    }
+}
 fn ipc_endpoint(service: &str) -> Result<String> {
     let variable = match service {
         "alarmd" => "YAM_ALARMD_ADDR",
@@ -1555,35 +1702,6 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                         .map_err(mlua::Error::external)
                 })?,
             )?;
-            if device.features.iter().any(|f| f == "led.logo.rgb") {
-                let logo = lua.create_table()?;
-                let logo_set = led.clone();
-                let cancelled_logo = cancelled.clone();
-                logo.set(
-                    "set",
-                    lua.create_function(move |_, colors: mlua::Table| {
-                        if cancelled_logo.load(Ordering::Relaxed) {
-                            return Err(mlua::Error::external("plugin stopped"));
-                        }
-                        let v = colors
-                            .sequence_values::<String>()
-                            .collect::<mlua::Result<Vec<_>>>()?;
-                        tokio::runtime::Handle::current()
-                            .block_on(logo_set.logo_set(v))
-                            .map_err(mlua::Error::external)
-                    })?,
-                )?;
-                let logo_off = led.clone();
-                logo.set(
-                    "off",
-                    lua.create_function(move |_, ()| {
-                        tokio::runtime::Handle::current()
-                            .block_on(logo_off.logo_off())
-                            .map_err(mlua::Error::external)
-                    })?,
-                )?;
-                api.set("logo", logo)?;
-            }
             let pattern_root = root.clone();
             let cancelled_play = cancelled.clone();
             api.set(
@@ -1815,6 +1933,47 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
                 "devices",
                 lua.create_function(|_, ()| {
                     fs::read_to_string("/proc/bus/input/devices").map_err(mlua::Error::external)
+                })?,
+            )?;
+            let input_manifest = manifest.clone();
+            let cancelled_input = cancelled.clone();
+            let mut reader: Option<InputReader> = None;
+            input.set(
+                "next_event",
+                lua.create_function_mut(move |lua, timeout_ms: u64| {
+                    if timeout_ms > 60_000 {
+                        return Err(mlua::Error::external(
+                            "input timeout is limited to 60 seconds",
+                        ));
+                    }
+                    if reader.is_none() {
+                        let opened = input_scope(&input_manifest)
+                            .and_then(|names| {
+                                let listing = fs::read_to_string("/proc/bus/input/devices")
+                                    .context("read /proc/bus/input/devices")?;
+                                resolve_input_devices(&listing, names)
+                            })
+                            .and_then(|devices| InputReader::open(&devices))
+                            .map_err(mlua::Error::external)?;
+                        reader = Some(opened);
+                    }
+                    let event = reader
+                        .as_mut()
+                        .expect("reader opened above")
+                        .next(timeout_ms, &cancelled_input)
+                        .map_err(mlua::Error::external)?;
+                    match event {
+                        Some(event) => {
+                            let table = lua.create_table()?;
+                            table.set("device", event.device)?;
+                            table.set("type", event.kind)?;
+                            table.set("code", event.code)?;
+                            table.set("value", event.value)?;
+                            table.set("time_ms", event.time_ms)?;
+                            Ok(mlua::Value::Table(table))
+                        }
+                        None => Ok(mlua::Value::Nil),
+                    }
                 })?,
             )?;
             api.set("input", input)?;
@@ -2353,9 +2512,6 @@ async fn stop_plugin(
     drop(plugins);
     if uses_led {
         let _ = a.led.off().await;
-        if a.led.logo_touched.load(Ordering::Relaxed) {
-            let _ = a.led.logo_off().await;
-        }
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2411,25 +2567,6 @@ async fn runtime_led(
 ) -> Result<StatusCode, ApiError> {
     runtime_permission(&a, &id, &headers, "led").await?;
     a.led.draw(frame.colors).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn runtime_logo(
-    State(a): State<App>,
-    AxumPath(id): AxumPath<String>,
-    headers: HeaderMap,
-    Json(frame): Json<Frame>,
-) -> Result<StatusCode, ApiError> {
-    runtime_permission(&a, &id, &headers, "led").await?;
-    a.led.logo_set(frame.colors).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn runtime_logo_off(
-    State(a): State<App>,
-    AxumPath(id): AxumPath<String>,
-    headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
-    runtime_permission(&a, &id, &headers, "led").await?;
-    a.led.logo_off().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 async fn runtime_led_off(
@@ -2524,14 +2661,6 @@ async fn led_set(State(a): State<App>, Json(f): Json<Frame>) -> Result<StatusCod
 }
 async fn led_off(State(a): State<App>) -> Result<StatusCode, ApiError> {
     a.led.off().await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn logo_set(State(a): State<App>, Json(f): Json<Frame>) -> Result<StatusCode, ApiError> {
-    a.led.logo_set(f.colors).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-async fn logo_off(State(a): State<App>) -> Result<StatusCode, ApiError> {
-    a.led.logo_off().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 #[derive(Debug)]
@@ -2684,7 +2813,6 @@ async fn main() -> Result<()> {
     };
     let led = Arc::new(Led {
         settings: Arc::new(Mutex::new(settings.led.clone())),
-        logo_touched: Arc::new(AtomicBool::new(false)),
     });
     let mut device = detect_device(&args.data_dir, args.model);
     let led_features = if configured_rgb_ring(&settings.led) {
@@ -2699,12 +2827,6 @@ async fn main() -> Result<()> {
         vec![]
     };
     for feature in led_features {
-        if !device.features.contains(&feature) {
-            device.features.push(feature);
-        }
-    }
-    if logo_available(&settings.led.sysfs_root) {
-        let feature = "led.logo.rgb".to_string();
         if !device.features.contains(&feature) {
             device.features.push(feature);
         }
@@ -2765,17 +2887,13 @@ async fn main() -> Result<()> {
             .route("/api/runtime/:id/sensors", get(runtime_sensors))
             .route("/api/runtime/:id/led", post(runtime_led))
             .route("/api/runtime/:id/led/off", post(runtime_led_off))
-            .route("/api/runtime/:id/logo", post(runtime_logo))
-            .route("/api/runtime/:id/logo/off", post(runtime_logo_off))
             .route("/api/runtime/:id/clock", post(runtime_clock))
             .route("/api/settings", get(get_settings).put(put_settings))
             .route("/api/device", get(get_device).put(put_device))
             .route("/api/sensors", get(get_sensors))
             .route("/api/clock", get(get_clock).put(put_clock))
             .route("/api/led", post(led_set))
-            .route("/api/led/off", post(led_off))
-            .route("/api/logo", post(logo_set))
-            .route("/api/logo/off", post(logo_off));
+            .route("/api/led/off", post(led_off));
     }
     let router = router
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -2791,43 +2909,6 @@ const UI: &str = include_str!("../web/index.html");
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn builds_logo_paths() {
-        assert_eq!(
-            logo_brightness_path("/sys/class/leds", "green", 5),
-            Path::new("/sys/class/leds/cucumber:green:logo5/brightness")
-        );
-    }
-
-    #[test]
-    fn logo_needs_all_eighteen_leds() {
-        let root = std::env::temp_dir().join(format!("yam-logo-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let root_str = root.to_str().unwrap();
-        assert!(!logo_available(root_str));
-        for i in 0..LOGO_COUNT {
-            for channel in ["red", "green", "blue"] {
-                let path = logo_brightness_path(root_str, channel, i);
-                fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(&path, "0").unwrap();
-            }
-        }
-        assert!(logo_available(root_str));
-        fs::remove_file(logo_brightness_path(root_str, "blue", 3)).unwrap();
-        assert!(!logo_available(root_str));
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    #[tokio::test]
-    async fn logo_rejects_wrong_color_count() {
-        let led = Led {
-            settings: Arc::new(Mutex::new(Settings::default().led)),
-            logo_touched: Arc::new(AtomicBool::new(false)),
-        };
-        let error = led.logo_set(vec!["#000000".into(); 5]).await.unwrap_err();
-        assert!(error.to_string().contains("expected 6 colors, got 5"));
-    }
 
     #[test]
     fn decodes_recognized_phrase() {
@@ -2846,90 +2927,6 @@ mod tests {
         let event = decode_ipc_event("alarmd", &message).unwrap().unwrap();
         assert_eq!(event["id"], "a1");
         assert_eq!(event["alarm_type"], 2);
-    }
-
-    fn pb_bytes(field: u32, body: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        push_varint(&mut out, u64::from(field) << 3 | 2);
-        push_varint(&mut out, body.len() as u64);
-        out.extend_from_slice(body);
-        out
-    }
-
-    fn pb_varint(field: u32, value: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        push_varint(&mut out, u64::from(field) << 3);
-        push_varint(&mut out, value);
-        out
-    }
-
-    fn wrap(kind: u64, body: &[u8]) -> Vec<u8> {
-        let mut out = pb_bytes(252, body);
-        out.extend(pb_varint(253, kind));
-        out
-    }
-
-    #[test]
-    fn decodes_wrapped_recognized_phrase() {
-        let state = pb_bytes(2, b"hi");
-        let event = decode_ipc_event("aliced", &wrap(3, &state))
-            .unwrap()
-            .unwrap();
-        assert_eq!(event["type"], "speech");
-        assert_eq!(event["source"], "voice");
-        assert_eq!(event["transcript"], "hi");
-        // Other wrapped message types are ignored.
-        assert!(decode_ipc_event("aliced", &wrap(210, &state))
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn decodes_wrapped_command_event() {
-        let mut state = pb_bytes(10, &pb_bytes(6, b"command"));
-        let mut request = pb_bytes(1, "стоп".as_bytes());
-        request.extend(pb_varint(2, 1));
-        state.extend(pb_bytes(15, &request));
-        let event = decode_ipc_event("aliced", &wrap(3, &state))
-            .unwrap()
-            .unwrap();
-        assert_eq!(event["source"], "command");
-        assert_eq!(event["transcript"], "стоп");
-
-        // Command wins over recognized_phrase in the same frame.
-        state.extend(pb_bytes(2, b"stop"));
-        let event = decode_ipc_event("aliced", &wrap(3, &state))
-            .unwrap()
-            .unwrap();
-        assert_eq!(event["source"], "command");
-        assert_eq!(event["transcript"], "стоп");
-
-        // Non-final command requests are ignored.
-        let mut partial = pb_bytes(1, b"sto");
-        partial.extend(pb_varint(2, 0));
-        let mut state = pb_bytes(10, &pb_bytes(6, b"command"));
-        state.extend(pb_bytes(15, &partial));
-        assert!(decode_ipc_event("aliced", &wrap(3, &state))
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn decodes_wrapped_alarm() {
-        let alarm = [0x0a, 0x06, 0x0a, 0x02, b'a', b'1', 0x10, 0x02];
-        let event = decode_ipc_event("alarmd", &wrap(215, &alarm))
-            .unwrap()
-            .unwrap();
-        assert_eq!(event["id"], "a1");
-    }
-
-    #[test]
-    fn reads_only_service_port_from_quasar_config() {
-        let config = r#"{"token":"not-a-real-secret","aliced":{"port":9875,"x":"y"},"alarmd":{},"bad":{"port":"1"}}"#;
-        assert_eq!(quasar_service_port(config, "aliced").unwrap(), Some(9875));
-        assert_eq!(quasar_service_port(config, "alarmd").unwrap(), None);
-        assert_eq!(quasar_service_port(config, "bad").unwrap(), None);
-        assert_eq!(quasar_service_port(config, "missing").unwrap(), None);
     }
 
     #[test]
@@ -3019,5 +3016,111 @@ mod tests {
             runtime_api_url("192.168.1.81:8099").unwrap(),
             "http://192.168.1.81:8099"
         );
+    }
+
+    fn input_manifest(extra: &str) -> Manifest {
+        toml::from_str(&format!(
+            "id = \"p\"\nname = \"p\"\nversion = \"1\"\nentry = \"main.lua\"\n{extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn decodes_64_bit_input_event() {
+        let mut bytes = vec![];
+        bytes.extend(1_700_000_000i64.to_ne_bytes());
+        bytes.extend(250_999i64.to_ne_bytes());
+        bytes.extend(1u16.to_ne_bytes());
+        bytes.extend(0x74u16.to_ne_bytes());
+        bytes.extend((-1i32).to_ne_bytes());
+        assert_eq!(bytes.len(), 24);
+        assert_eq!(input_event_size(8), 24);
+        let event = decode_input_event("mute", &bytes, 8).unwrap();
+        assert_eq!(
+            event,
+            InputEvent {
+                device: "mute".into(),
+                kind: 1,
+                code: 0x74,
+                value: -1,
+                time_ms: 1_700_000_000_250,
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_32_bit_input_event_and_rejects_wrong_length() {
+        let mut bytes = vec![];
+        bytes.extend(10i32.to_ne_bytes());
+        bytes.extend(2_000i32.to_ne_bytes());
+        bytes.extend(3u16.to_ne_bytes());
+        bytes.extend(4u16.to_ne_bytes());
+        bytes.extend(5i32.to_ne_bytes());
+        let event = decode_input_event("d", &bytes, 4).unwrap();
+        assert_eq!((event.kind, event.code, event.value), (3, 4, 5));
+        assert_eq!(event.time_ms, 10_002);
+        assert!(decode_input_event("d", &bytes[..15], 4).is_err());
+        assert!(decode_input_event("d", &bytes, 8).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_event_size_matches_libc() {
+        assert_eq!(
+            input_event_size(std::mem::size_of::<libc::c_long>()),
+            std::mem::size_of::<libc::input_event>()
+        );
+    }
+
+    const FAKE_PROC_INPUT: &str = "I: Bus=0019 Vendor=0001 Product=0001 Version=0100\n\
+N: Name=\"input_btrcu\"\n\
+H: Handlers=event0 \n\
+\n\
+I: Bus=0019 Vendor=0001 Product=0002 Version=0100\n\
+N: Name=\"vad_keypad\"\n\
+H: Handlers=kbd event1 \n\
+\n\
+I: Bus=0019 Vendor=0001 Product=0003 Version=0100\n\
+N: Name=\"mute\"\n\
+H: Handlers=event2 \n\
+\n\
+I: Bus=0019 Vendor=0001 Product=0004 Version=0100\n\
+N: Name=\"awinic_sar\"\n\
+H: Handlers=event3 \n\
+\n";
+
+    #[test]
+    fn resolves_declared_input_devices_only() {
+        let names = vec!["mute".to_string(), "awinic_sar".to_string()];
+        let devices = resolve_input_devices(FAKE_PROC_INPUT, &names).unwrap();
+        assert_eq!(
+            devices,
+            vec![
+                ("mute".to_string(), PathBuf::from("/dev/input/event2")),
+                ("awinic_sar".to_string(), PathBuf::from("/dev/input/event3")),
+            ]
+        );
+        assert!(resolve_input_devices(FAKE_PROC_INPUT, &["missing".to_string()]).is_err());
+        assert!(resolve_input_devices(FAKE_PROC_INPUT, &[]).is_err());
+        assert!(resolve_input_devices(FAKE_PROC_INPUT, &["mut".to_string()]).is_err());
+    }
+
+    #[test]
+    fn manifest_without_input_devices_is_rejected_for_events() {
+        let none = input_manifest("permissions = [\"input\"]\n");
+        assert!(input_scope(&none).is_err());
+        let declared = input_manifest(
+            "permissions = [\"input\"]\n[input]\ndevices = [\"vad_keypad\", \"mute\"]\n",
+        );
+        assert_eq!(input_scope(&declared).unwrap(), ["vad_keypad", "mute"]);
+        assert!(validate_input_policy(&declared).is_ok());
+    }
+
+    #[test]
+    fn input_devices_require_input_permission_and_valid_names() {
+        let no_permission = input_manifest("[input]\ndevices = [\"mute\"]\n");
+        assert!(validate_input_policy(&no_permission).is_err());
+        let blank = input_manifest("permissions = [\"input\"]\n[input]\ndevices = [\" \"]\n");
+        assert!(validate_input_policy(&blank).is_err());
     }
 }
