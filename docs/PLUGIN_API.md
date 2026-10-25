@@ -60,8 +60,8 @@ tar -C package-source -czf my-package.yap plugin.toml main.lua assets/
 | `clock` | `alice.clock.available()`, `time("HH:MM", brightness)`, `segments(levels)`, `off()` | `display.clock.segment.v1` |
 | `input` | `alice.input.devices()` | `input.evdev` |
 | `network` | `alice.http.get(url)`, `alice.http.post(url, body)` | непустой `[network].allow` |
-| `ipc.alarm` | `alice.ipc.next_alarm(timeout_ms)` | `YAM_ALARMD_ADDR` у daemon |
-| `ipc.speech` | `alice.ipc.next_speech(timeout_ms)` | `YAM_ALICED_ADDR` у daemon |
+| `ipc.alarm` | `alice.ipc.next_alarm(timeout_ms)` | `YAM_ALARMD_ADDR` у daemon (на Midi порта alarmd нет) |
+| `ipc.speech` | `alice.ipc.next_speech(timeout_ms)` | `YAM_ALICED_ADDR` или порт `aliced` из `quasar.cfg` |
 | `system` | `alice.system.hostname()`, `uptime()`, `meminfo()` | нет |
 | `exec` | `alice.exec(program, args)` | runtime-настройка `allow_plugin_binaries = true` |
 
@@ -86,9 +86,9 @@ allow = ["api.example.org", "*.example.net"]
 
 YAM подключается к **двум разрешённым** IPC-сервисам и декодирует только документированные поля `QuasarMessage`: `AliceState.recognized_phrase` и `AlarmEvent.alarm_fired`. Он не даёт Lua raw protobuf, команды IPC или доступ к другим сервисам.
 
-Администратор daemon задаёт адреса сервисов (обычно loopback-порты из конфигурации прошивки): `YAM_ALARMD_ADDR=127.0.0.1:PORT` и `YAM_ALICED_ADDR=127.0.0.1:PORT`. Это намеренно не настраивается пакетом.
+Администратор daemon может задать адреса сервисов: `YAM_ALARMD_ADDR=127.0.0.1:PORT` и `YAM_ALICED_ADDR=127.0.0.1:PORT`; без них yamd берёт только `<сервис>.port` из `/system/vendor/quasar/quasar.cfg`. Это намеренно не настраивается пакетом. Кадры Midi с обёрткой (поля 252/253) поддерживаются, см. IPC.md.
 
-`alice.ipc.next_alarm(timeout_ms)` возвращает `nil` по тайм-ауту либо `{ type = "alarm_fired", id, alarm_type, start_timestamp_ms, duration_seconds, remind_message, currently_playing }`. `alice.ipc.next_speech(timeout_ms)` соответственно возвращает `nil` либо `{ type = "speech", transcript }`. Тайм-аут — до 60 секунд. Распознанная речь относится к персональным данным: запрашивайте `ipc.speech` только при необходимости, предупреждайте пользователя и не передавайте текст в сеть без одновременно объявленного `network`.
+`alice.ipc.next_alarm(timeout_ms)` возвращает `nil` по тайм-ауту либо `{ type = "alarm_fired", id, alarm_type, start_timestamp_ms, duration_seconds, remind_message, currently_playing }`. `alice.ipc.next_speech(timeout_ms)` соответственно возвращает `nil` либо `{ type = "speech", source, transcript }`, где `source` — `"voice"` (распознанная фраза после wake-word) или `"command"` (команда спуфера без wake-word, например «стоп»). Тайм-аут — до 60 секунд. Распознанная речь относится к персональным данным: запрашивайте `ipc.speech` только при необходимости, предупреждайте пользователя и не передавайте текст в сеть без одновременно объявленного `network`.
 
 ### Датчики
 

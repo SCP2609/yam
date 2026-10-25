@@ -3,7 +3,7 @@
 YAM — IPC-клиент, а не прокси и не man-in-the-middle. Поддерживаются только read-only события:
 
 - `alarmd`: `QuasarMessage.alarm_event.alarm_fired` (поле 215);
-- `aliced`: `QuasarMessage.alice_state.recognized_phrase` (поле 3).
+- `aliced`: `QuasarMessage.alice_state.recognized_phrase` (поле 3) и финальные команды-спуфера (`event_source.type == "command"`).
 
 Транспорт в SDK — TCP с little-endian 32-bit length prefix и protobuf `QuasarMessage`. Адреса в разных прошивках не стабильны, поэтому задаются оператором daemon, а не архивом пакета:
 
@@ -15,6 +15,12 @@ Environment=YAM_ALICED_ADDR=127.0.0.1:9913
 ```
 
 Указанные номера приведены только как пример. Перед настройкой следует сверить назначение портов с конфигурацией конкретной прошивки; YAM не сканирует порты и не делает предположений о модели.
+
+Если переменная не задана, yamd читает `/system/vendor/quasar/quasar.cfg` (JSON) и берёт только числовое поле `<сервис>.port` → `127.0.0.1:<port>`; остальное содержимое файла (в нём есть секреты) не используется и не логируется. Переменные окружения имеют приоритет. На Yandex Station Midi `aliced` слушает порт из `quasar.cfg` (обычно 9875), порта `alarmd` там нет — `ipc.alarm` на Midi недоступен.
+
+**Формат кадра.** Кроме прямого `QuasarMessage` (старые прошивки), принимается обёртка Midi: поле 252 (bytes) — тело сообщения, поле 253 (varint) — номер поля `QuasarMessage`, которому это тело соответствует (3 → `AliceState`, 215 → `AlarmEvent`). Такой кадр обрабатывается как `QuasarMessage{<253>: <252>}`.
+
+**Поле `source`.** События речи содержат `source`: `"voice"` — `AliceState.recognized_phrase` (поле 2); `"command"` — команда без wake-word (спуфер: `event_source`(10).`type`(6) = `"command"`, финальный `request_state`(15), текст — поле 1). Если оба поля есть в одном кадре, выдаётся только `command`.
 
 Не поддерживаются отправка команд, перехват аудио, токенов, VINS/directive payload и raw protobuf. Эти данные либо чувствительны, либо способны изменить состояние штатных сервисов.
 
