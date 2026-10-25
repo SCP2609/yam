@@ -34,3 +34,11 @@ tar = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[profile.release]
+# The daemon is deployed to storage-constrained speakers.
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
