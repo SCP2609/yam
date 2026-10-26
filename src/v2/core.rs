@@ -90,12 +90,35 @@ pub struct PackageSource {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub entware: Option<EntwareRequest>,
+    #[serde(default)]
+    pub services: BTreeMap<String, ServiceSpec>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EntwareRequest {
     pub packages: Vec<String>,
+}
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSpec {
+    pub exec: Vec<String>,
+    #[serde(default)]
+    pub restart: RestartPolicy,
+    #[serde(default)]
+    pub after: Vec<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub oneshot: bool,
+}
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RestartPolicy {
+    Always,
+    OnFailure,
+    #[default]
+    Never,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -125,6 +148,8 @@ pub struct PackageManifest {
     pub permissions: Vec<String>,
     #[serde(default)]
     pub entware: Option<EntwareRequest>,
+    #[serde(default)]
+    pub services: BTreeMap<String, ServiceSpec>,
     pub files_sha256: BTreeMap<String, String>,
 }
 
@@ -267,6 +292,7 @@ impl Manager {
             replaces: source.replaces,
             permissions: source.permissions,
             entware: source.entware,
+            services: source.services,
             files_sha256: hashes,
         };
         validate_manifest(&manifest)?;
