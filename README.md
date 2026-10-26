@@ -1,24 +1,12 @@
-# YAM
+# YAM v2
 
-yam = Y Application Manager. Ставьте на свою колонку .yap.
+YAM is a package manager for Yandex Stations.
 
-Linux / macOS:
-```sh
-curl -fsSL https://hackalice.me/install.sh | sh
-```
+- Package source: `yam.yaml`
+- Package artifact: `.yampkg` (`tar.zst`)
+- Platform profiles: `platforms/`
+- Registry and package workflow: [docs/V2_REGISTRY.md](docs/V2_REGISTRY.md)
+- Package format and CLI: [docs/V2_PACKAGE_MANAGER.md](docs/V2_PACKAGE_MANAGER.md)
 
-Windows:
-
-```powershell
-irm https://hackalice.me/install.ps1 | iex
-```
-
-Установщик сам найдет рабочую колонку и установит через adb на нее `yamd`
-
-# Документация
-
-- [Установка и эксплуатация](docs/DEPLOYMENT.md)
-- [Пакеты и CLI](docs/PACKAGES.md)
-- [Lua API плагинов](docs/PLUGIN_API.md)
-
-Примеры [`examples/`](examples/).
+The project contains no embedded web UI, hardware runtime, Lua runtime, or
+legacy `.yap` compatibility layer. Those are independent host packages.

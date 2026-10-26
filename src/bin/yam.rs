@@ -3,8 +3,7 @@ use clap::{Parser, Subcommand};
 use std::{
     collections::BTreeMap,
     fs,
-    io::Read,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
 };
 use uuid::Uuid;
 use yam::v2::registry;
@@ -70,16 +69,6 @@ enum Command {
     Plan {
         package: String,
     },
-    /// Convert a legacy .yap archive into a reviewable v2 source tree.
-    ConvertYap {
-        archive: PathBuf,
-        output: PathBuf,
-    },
-    /// The v1 HTTP client remains available during migration.
-    Legacy {
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
 }
 #[derive(Subcommand)]
 enum EntwareCommand {
@@ -102,18 +91,9 @@ enum RegistryCommand {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Command::Legacy { args } = &cli.command {
-        let executable = std::env::current_exe()?.with_file_name("yam-legacy");
-        let status = std::process::Command::new(executable).args(args).status()?;
-        if !status.success() {
-            bail!("yam-legacy exited with {status}")
-        }
-        return Ok(());
-    }
     let profile = PlatformProfile::load(&cli.profiles, &cli.platform)?;
     match cli.command {
         Command::Pack { source, output } => Manager::pack(&source, &profile, &output),
-        Command::ConvertYap { archive, output } => convert_yap(&archive, &output),
         command => {
             let root = cli.root.unwrap_or_else(|| profile.paths.root.clone());
             let mut manager = Manager::open(root, profile)?;
@@ -224,7 +204,7 @@ fn main() -> Result<()> {
                         );
                     }
                 }
-                Command::Pack { .. } | Command::ConvertYap { .. } | Command::Legacy { .. } => {
+                Command::Pack { .. } => {
                     unreachable!()
                 }
             }
@@ -310,138 +290,4 @@ fn split_package_version(value: &str) -> Result<(&str, Option<&str>)> {
         bail!("package name must be name or name@version")
     }
     Ok((name, version))
-}
-
-fn convert_yap(archive: &Path, output: &Path) -> Result<()> {
-    if output.exists() {
-        bail!("output already exists: {}", output.display())
-    }
-    fs::create_dir_all(output.join("payload"))?;
-    let mut manifest = None;
-    if archive
-        .extension()
-        .is_some_and(|extension| extension == "yap")
-        && zip::ZipArchive::new(fs::File::open(archive)?).is_ok()
-    {
-        let mut zip = zip::ZipArchive::new(fs::File::open(archive)?)?;
-        for index in 0..zip.len() {
-            let mut entry = zip.by_index(index)?;
-            let path = entry.enclosed_name().context("unsafe ZIP path")?.to_owned();
-            if entry.is_dir() {
-                continue;
-            }
-            let name = path.to_string_lossy().to_string();
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
-            extract_legacy_file(output, &name, bytes, &mut manifest)?;
-        }
-    } else {
-        let file = fs::File::open(archive)?;
-        let mut tar = tar::Archive::new(flate2::read::GzDecoder::new(file));
-        for entry in tar.entries()? {
-            let mut entry = entry?;
-            if !entry.header().entry_type().is_file() {
-                continue;
-            }
-            let path = entry.path()?.into_owned();
-            safe_relative(&path)?;
-            let name = path.to_string_lossy().to_string();
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes)?;
-            extract_legacy_file(output, &name, bytes, &mut manifest)?;
-        }
-    }
-    let manifest = manifest.context("legacy archive has no root plugin.toml")?;
-    let value: toml::Value = toml::from_str(&String::from_utf8(manifest)?)?;
-    let id = value
-        .get("id")
-        .and_then(toml::Value::as_str)
-        .context("legacy manifest has no id")?;
-    let name = id
-        .chars()
-        .map(|character| {
-            if character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-' {
-                character
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let version = value
-        .get("version")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("0.0.0");
-    let description = value
-        .get("description")
-        .and_then(toml::Value::as_str)
-        .unwrap_or("Converted legacy package");
-    let mut files = serde_yaml::Mapping::new();
-    for entry in walkdir::WalkDir::new(output.join("payload")).min_depth(1) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let path = entry
-            .path()
-            .strip_prefix(output.join("payload"))?
-            .to_string_lossy()
-            .replace('\\', "/");
-        files.insert(
-            serde_yaml::Value::String(path.clone()),
-            serde_yaml::Value::String(format!("payload/{path}")),
-        );
-    }
-    let mut document = serde_yaml::Mapping::new();
-    document.insert("name".into(), format!("legacy/{name}").into());
-    document.insert("version".into(), version.into());
-    document.insert("license".into(), "NOASSERTION".into());
-    document.insert("description".into(), description.into());
-    document.insert(
-        "targets".into(),
-        serde_yaml::Value::Sequence(vec!["any".into()]),
-    );
-    document.insert("files".into(), serde_yaml::Value::Mapping(files));
-    fs::write(output.join("yam.yaml"), serde_yaml::to_string(&document)?)?;
-    fs::write(output.join("MIGRATION.md"), "This tree was converted from a legacy .yap archive. Review yam.yaml, choose real targets, and migrate any Lua runtime metadata before packing. No legacy permissions, launch settings, or hooks were imported.\n")?;
-    println!(
-        "Converted {} to {}. Review yam.yaml before packing.",
-        archive.display(),
-        output.display()
-    );
-    Ok(())
-}
-fn extract_legacy_file(
-    output: &Path,
-    name: &str,
-    bytes: Vec<u8>,
-    manifest: &mut Option<Vec<u8>>,
-) -> Result<()> {
-    let path = Path::new(name);
-    safe_relative(path)?;
-    if name == "plugin.toml" {
-        if manifest.replace(bytes).is_some() {
-            bail!("duplicate plugin.toml")
-        };
-        return Ok(());
-    }
-    let target = output.join("payload").join(path);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(target, bytes)?;
-    Ok(())
-}
-fn safe_relative(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        bail!("unsafe archive path")
-    }
-    Ok(())
 }

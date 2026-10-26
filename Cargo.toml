@@ -4,48 +4,28 @@ version = "0.1.18"
 edition = "2021"
 
 [[bin]]
-name = "yamd"
-path = "src/main.rs"
-
-[[bin]]
 name = "yam"
 path = "src/bin/yam.rs"
-
-[[bin]]
-name = "yam-legacy"
-path = "src/bin/yam_legacy.rs"
 
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
-axum = { version = "0.7", features = ["multipart"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
-flate2 = "1"
-mlua = { version = "0.10", features = ["lua54", "vendored", "serialize", "send"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 rusqlite = { version = "0.32", features = ["bundled"] }
 url = "2"
-tokio = { version = "1", features = ["full"] }
-toml = "0.8"
-tower-http = { version = "0.6", features = ["trace"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
-zip = "2"
 tar = "0.4"
 zstd = "0.13"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 [profile.release]
-# The daemon is deployed to storage-constrained speakers.
+# The manager is deployed to storage-constrained speakers.
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
