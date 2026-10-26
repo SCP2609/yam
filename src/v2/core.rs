@@ -20,6 +20,12 @@ pub struct PlatformProfile {
     pub triple: String,
     pub paths: PlatformPaths,
     #[serde(default)]
+    pub firmware_version_file: Option<PathBuf>,
+    #[serde(default)]
+    pub init: Option<String>,
+    #[serde(default)]
+    pub boot_hook: Option<PathBuf>,
+    #[serde(default)]
     pub entware: Option<EntwareProfile>,
 }
 

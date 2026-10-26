@@ -1,4 +1,6 @@
 use anyhow::{bail, Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine};
+use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -125,7 +127,7 @@ pub fn registry(root: &Path, name: &str) -> Result<Registry> {
         .context("registry not configured")
 }
 pub fn catalogue(registry: &Registry) -> Result<Catalogue> {
-    get_json(&registry.url, "index.json")
+    get_signed_json(registry, "index.json")
 }
 pub fn package_index(registry: &Registry, name: &str) -> Result<PackageIndex> {
     let mut parts = name.split('/');
@@ -138,8 +140,8 @@ pub fn package_index(registry: &Registry, name: &str) -> Result<PackageIndex> {
     if parts.next().is_some() {
         bail!("package name must be namespace/name")
     }
-    let index: PackageIndex = get_json(
-        &registry.url,
+    let index: PackageIndex = get_signed_json(
+        registry,
         &format!("packages/{namespace}/{package}/index.json"),
     )?;
     if index.format != 2 || index.name != name {
@@ -339,15 +341,45 @@ fn same_parts(version: &str, expected: &str, count: usize) -> bool {
         .take(count)
         .all(|(left, right)| left == right)
 }
-fn get_json<T: for<'a> Deserialize<'a>>(base: &str, path: &str) -> Result<T> {
-    let url = Url::parse(&format!("{}/", base.trim_end_matches('/')))?.join(path)?;
-    let response = Client::builder()
+fn get_signed_json<T: for<'a> Deserialize<'a>>(registry: &Registry, path: &str) -> Result<T> {
+    let base = Url::parse(&format!("{}/", registry.url.trim_end_matches('/')))?;
+    let client = Client::builder()
         .timeout(std::time::Duration::from_secs(30))
-        .build()?
-        .get(url)
+        .build()?;
+    let body = client
+        .get(base.join(path)?)
         .send()?
-        .error_for_status()?;
-    Ok(response.json()?)
+        .error_for_status()?
+        .bytes()?
+        .to_vec();
+    let signature = client
+        .get(base.join(&format!("{path}.sig"))?)
+        .send()?
+        .error_for_status()?
+        .text()?;
+    verify_signature(&registry.key, &body, signature.trim())?;
+    Ok(serde_json::from_slice(&body)?)
+}
+fn verify_signature(key: &str, body: &[u8], signature: &str) -> Result<()> {
+    let encoded = key
+        .strip_prefix("ed25519:")
+        .context("registry key must use ed25519: format")?;
+    let bytes = STANDARD
+        .decode(encoded)
+        .context("invalid registry public key encoding")?;
+    let key = VerifyingKey::from_bytes(
+        bytes
+            .as_slice()
+            .try_into()
+            .context("registry public key must be 32 bytes")?,
+    )?;
+    let signature = Signature::from_slice(
+        &STANDARD
+            .decode(signature)
+            .context("invalid registry signature encoding")?,
+    )?;
+    key.verify(body, &signature)
+        .context("registry index signature verification failed")
 }
 fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     let parse = |value: &str| {

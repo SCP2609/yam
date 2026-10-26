@@ -1,6 +1,9 @@
 id: yandexmicro
 arch: aarch64
 triple: aarch64-unknown-linux-musl
+firmware_version_file: /system/vendor/quasar/version_full
+init: busybox-init
+boot_hook: /etc/init.d/S99yam
 paths:
   root: /data/yam
   etc: /data/yam/etc

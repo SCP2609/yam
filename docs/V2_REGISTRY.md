@@ -87,16 +87,16 @@ for upgrades is still part of the transaction-engine milestone.
 
 ## Trust model
 
-The design has three layers: HTTPS transport, a signature on canonical registry
-metadata by a configured registry key, and author signatures bound to namespace
+The design has three layers: HTTPS transport, a signature on registry metadata
+by a configured registry key, and author signatures bound to namespace
 ownership. SHA-256 is mandatory for every artifact but is not a substitute for
 metadata signatures.
 
-The initial client implementation validates HTTPS and artifact SHA-256. It
-stores the configured `ed25519:` key but deliberately does **not** claim to
-verify signatures until the registry defines the signature envelope and
-canonical JSON representation. Registries requiring signature verification
-must not be used with that bootstrap client.
+The v2 envelope is deliberately simple: a registry serves the exact UTF-8 JSON
+bytes at `index.json` (or a package index) and a Base64 detached Ed25519
+signature of those exact bytes at the same URL plus `.sig`. Registry keys use
+`ed25519:<base64-32-byte-public-key>`. YAM verifies both catalogue and package
+index before reading them; no JSON reformatting or canonicalization is involved.
 
 ## Publication service
 
