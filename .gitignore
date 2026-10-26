@@ -3,3 +3,6 @@
 *.yap
 *.log
 .DS_Store
+
+# Per-package Rust build output
+**/target/
