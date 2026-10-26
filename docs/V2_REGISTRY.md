@@ -65,12 +65,19 @@ yam registry list
 yam registry remove official
 yam search spotify
 yam info nikita/soloist
+yam plan nikita/soloist
 yam install nikita/soloist
 yam install nikita/soloist@1.4.0
 ```
 
 Registry configuration is local under YAM's state root. Adding a third-party
 registry is explicit; YAM never discovers or trusts one automatically.
+
+`yam plan` recursively resolves concrete `namespace/name` dependencies from
+the version metadata, chooses a compatible target artifact and prints a
+dependency-first order without changing disk state. A virtual dependency needs
+the registry's provider-selection policy and is rejected until that policy is
+part of the index contract.
 
 ## Trust model
 

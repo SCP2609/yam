@@ -64,6 +64,10 @@ enum Command {
     Info {
         name: String,
     },
+    /// Resolve and display the registry dependency graph without changing disk state.
+    Plan {
+        package: String,
+    },
     /// Convert a legacy .yap archive into a reviewable v2 source tree.
     ConvertYap {
         archive: PathBuf,
@@ -215,6 +219,26 @@ fn main() -> Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&registry::package_index(&selected, &name)?)?
                     );
+                }
+                Command::Plan { package } => {
+                    let (name, version) = split_package_version(&package)?;
+                    let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+                    let packages = registry::resolve(&selected, name, manager.profile())?;
+                    if let Some(version) = version {
+                        let root = packages.last().context("empty registry plan")?;
+                        if root.version != version {
+                            bail!(
+                                "requested {name}@{version}, registry selected {}",
+                                root.version
+                            )
+                        }
+                    }
+                    for package in packages {
+                        println!(
+                            "{}\t{}\t{}",
+                            package.name, package.version, package.artifact.url
+                        );
+                    }
                 }
                 Command::Pack { .. } | Command::ConvertYap { .. } | Command::Legacy { .. } => {
                     unreachable!()

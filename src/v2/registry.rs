@@ -2,7 +2,11 @@ use anyhow::{bail, Context, Result};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 use url::Url;
 
 use super::core::PlatformProfile;
@@ -43,6 +47,14 @@ pub struct PackageIndex {
 pub struct VersionMetadata {
     pub artifacts: BTreeMap<String, Artifact>,
     pub published_at: Option<String>,
+    #[serde(default)]
+    pub depends: Vec<String>,
+    #[serde(default)]
+    pub recommends: Vec<String>,
+    #[serde(default)]
+    pub provides: Vec<String>,
+    #[serde(default)]
+    pub conflicts: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
@@ -50,6 +62,12 @@ pub struct Artifact {
     pub url: String,
     pub sha256: String,
     pub size: u64,
+}
+#[derive(Debug, Clone)]
+pub struct ResolvedPackage {
+    pub name: String,
+    pub version: String,
+    pub artifact: Artifact,
 }
 
 pub fn config_path(root: &Path) -> std::path::PathBuf {
@@ -187,6 +205,136 @@ pub fn download_artifact(registry: &Registry, artifact: &Artifact) -> Result<Vec
         bail!("artifact checksum mismatch")
     }
     Ok(bytes)
+}
+pub fn resolve(
+    registry: &Registry,
+    requested: &str,
+    profile: &PlatformProfile,
+) -> Result<Vec<ResolvedPackage>> {
+    let mut resolved = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
+    resolve_one(
+        registry,
+        requested,
+        None,
+        profile,
+        &mut resolved,
+        &mut visiting,
+    )?;
+    Ok(resolved.into_values().collect())
+}
+fn resolve_one(
+    registry: &Registry,
+    name: &str,
+    requested_version: Option<&str>,
+    profile: &PlatformProfile,
+    resolved: &mut BTreeMap<String, ResolvedPackage>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<()> {
+    if resolved.contains_key(name) {
+        return Ok(());
+    }
+    if !name.contains('/') {
+        bail!("virtual dependency {name:?} requires a registry provider policy")
+    }
+    if !visiting.insert(name.into()) {
+        bail!("dependency cycle detected at {name}")
+    }
+    let index = package_index(registry, name)?;
+    let (version, artifact) = select_artifact(&index, requested_version, profile)?;
+    let metadata = index
+        .versions
+        .get(&version)
+        .expect("selected version exists");
+    for requirement in &metadata.depends {
+        let (dependency, constraints) = split_requirement(requirement)?;
+        let dependency_index = package_index(registry, dependency)?;
+        let selected = select_version(&dependency_index, &constraints)?;
+        resolve_one(
+            registry,
+            dependency,
+            Some(&selected),
+            profile,
+            resolved,
+            visiting,
+        )?;
+    }
+    visiting.remove(name);
+    resolved.insert(
+        name.into(),
+        ResolvedPackage {
+            name: name.into(),
+            version,
+            artifact,
+        },
+    );
+    Ok(())
+}
+fn split_requirement(value: &str) -> Result<(&str, Vec<&str>)> {
+    let mut words = value.split_whitespace();
+    let name = words.next().context("empty dependency")?;
+    let constraints = words.collect::<Vec<_>>();
+    if constraints.iter().any(|constraint| {
+        ![">=", "<", "^", "~", "="]
+            .iter()
+            .any(|operator| constraint.starts_with(operator))
+    }) {
+        bail!("invalid dependency constraint {value:?}")
+    }
+    Ok((name, constraints))
+}
+fn select_version(index: &PackageIndex, constraints: &[&str]) -> Result<String> {
+    index
+        .versions
+        .keys()
+        .filter(|version| {
+            !version.contains('-')
+                && constraints
+                    .iter()
+                    .all(|constraint| version_matches(version, constraint))
+        })
+        .max_by(|left, right| version_cmp(left, right))
+        .cloned()
+        .context("no registry version satisfies dependency")
+}
+fn version_matches(version: &str, constraint: &str) -> bool {
+    let Some((operator, expected)) = [">=", "^", "~", "=", "<"].iter().find_map(|operator| {
+        constraint
+            .strip_prefix(operator)
+            .map(|expected| (*operator, expected))
+    }) else {
+        return false;
+    };
+    let compare = version_cmp(version, &normalize_version(expected));
+    match operator {
+        ">=" => compare.is_ge(),
+        "<" => compare.is_lt(),
+        "=" => compare.is_eq(),
+        "~" => compare.is_ge() && same_parts(version, expected, 2),
+        "^" => {
+            compare.is_ge()
+                && same_parts(
+                    version,
+                    expected,
+                    if expected.starts_with("0.") { 2 } else { 1 },
+                )
+        }
+        _ => false,
+    }
+}
+fn normalize_version(value: &str) -> String {
+    let mut parts = value.split('.').collect::<Vec<_>>();
+    while parts.len() < 3 {
+        parts.push("0");
+    }
+    parts.join(".")
+}
+fn same_parts(version: &str, expected: &str, count: usize) -> bool {
+    version
+        .split('.')
+        .zip(expected.split('.'))
+        .take(count)
+        .all(|(left, right)| left == right)
 }
 fn get_json<T: for<'a> Deserialize<'a>>(base: &str, path: &str) -> Result<T> {
     let url = Url::parse(&format!("{}/", base.trim_end_matches('/')))?.join(path)?;
