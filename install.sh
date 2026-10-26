@@ -52,7 +52,7 @@ verify() {
 }
 
 command -v adb >/dev/null 2>&1 || {
-  echo 'adb is required to deploy yamd. Install Android Platform Tools first.' >&2; exit 4;
+  echo 'adb is required to deploy yam-lua-runtime. Install Android Platform Tools first.' >&2; exit 4;
 }
 
 choose_device() {
@@ -111,7 +111,7 @@ if [ "$ACTION" = uninstall ]; then
     mount -o remount,rw /
     trap 'mount -o remount,ro /' EXIT
     rm -f $INIT_SCRIPT
-    if [ -f $DEVICE_PREFIX/yamd.pid ] && kill -0 \$(cat $DEVICE_PREFIX/yamd.pid) 2>/dev/null; then kill \$(cat $DEVICE_PREFIX/yamd.pid); fi
+    if [ -f $DEVICE_PREFIX/yam-lua-runtime.pid ] && kill -0 \$(cat $DEVICE_PREFIX/yam-lua-runtime.pid) 2>/dev/null; then kill \$(cat $DEVICE_PREFIX/yam-lua-runtime.pid); fi
     rm -rf $DEVICE_PREFIX" </dev/null
   echo "YAM removed from $BIN_DIR and $DEVICE ($DEVICE_PREFIX)."
   exit 0
@@ -119,20 +119,20 @@ fi
 
 download "$RELEASE_URL/SHA256SUMS" "$tmpdir/SHA256SUMS"
 download "$RELEASE_URL/$CLI_ASSET" "$tmpdir/$CLI_ASSET"
-download "$RELEASE_URL/yamd-aarch64-linux-musl" "$tmpdir/yamd-aarch64-linux-musl"
+download "$RELEASE_URL/yam-lua-runtime-aarch64-linux-musl" "$tmpdir/yam-lua-runtime-aarch64-linux-musl"
 verify "$tmpdir/$CLI_ASSET"
-verify "$tmpdir/yamd-aarch64-linux-musl"
+verify "$tmpdir/yam-lua-runtime-aarch64-linux-musl"
 
 mkdir -p "$BIN_DIR"
 install -m 0755 "$tmpdir/$CLI_ASSET" "$BIN_DIR/yam-bin"
 cat >"$BIN_DIR/yam" <<EOF
 #!/bin/sh
-exec env YAM_URL="\${YAM_URL:-http://$STATION_IP:8099}" "$BIN_DIR/yam-bin" "\$@"
+exec "$BIN_DIR/yam-bin" "\$@"
 EOF
 chmod 0755 "$BIN_DIR/yam"
 adb -s "$DEVICE" shell "mkdir -p $DEVICE_PREFIX/bin $DEVICE_PREFIX/data" </dev/null
-adb -s "$DEVICE" push "$tmpdir/yamd-aarch64-linux-musl" "$DEVICE_PREFIX/bin/yamd.new" </dev/null >/dev/null
-adb -s "$DEVICE" shell "chmod 0755 $DEVICE_PREFIX/bin/yamd.new; if [ -f $DEVICE_PREFIX/yamd.pid ] && kill -0 \$(cat $DEVICE_PREFIX/yamd.pid) 2>/dev/null; then kill \$(cat $DEVICE_PREFIX/yamd.pid); fi; mv $DEVICE_PREFIX/bin/yamd.new $DEVICE_PREFIX/bin/yamd; start-stop-daemon --start --background --make-pidfile --pidfile $DEVICE_PREFIX/yamd.pid --startas $DEVICE_PREFIX/bin/yamd -- --data-dir $DEVICE_PREFIX/data" </dev/null
+adb -s "$DEVICE" push "$tmpdir/yam-lua-runtime-aarch64-linux-musl" "$DEVICE_PREFIX/bin/yam-lua-runtime.new" </dev/null >/dev/null
+adb -s "$DEVICE" shell "chmod 0755 $DEVICE_PREFIX/bin/yam-lua-runtime.new; if [ -f $DEVICE_PREFIX/yam-lua-runtime.pid ] && kill -0 \$(cat $DEVICE_PREFIX/yam-lua-runtime.pid) 2>/dev/null; then kill \$(cat $DEVICE_PREFIX/yam-lua-runtime.pid); fi; mv $DEVICE_PREFIX/bin/yam-lua-runtime.new $DEVICE_PREFIX/bin/yam-lua-runtime; start-stop-daemon --start --background --make-pidfile --pidfile $DEVICE_PREFIX/yam-lua-runtime.pid --startas $DEVICE_PREFIX/bin/yam-lua-runtime -- --data-dir $DEVICE_PREFIX/data" </dev/null
 adb -s "$DEVICE" shell "set -eu
   mount -o remount,rw /
   trap 'mount -o remount,ro /' EXIT
@@ -142,24 +142,24 @@ adb -s "$DEVICE" shell "set -eu
 case \"\${1:-}\" in
   start)
     prefix=/data/quazar/yam
-    pidfile=\"\$prefix/yamd.pid\"
-    [ -x \"\$prefix/bin/yamd\" ] || exit 0
+    pidfile=\"\$prefix/yam-lua-runtime.pid\"
+    [ -x \"\$prefix/bin/yam-lua-runtime\" ] || exit 0
     mkdir -p \"\$prefix/data\"
     if [ -f \"\$pidfile\" ] && kill -0 \"\$(cat \"\$pidfile\")\" 2>/dev/null; then
       exit 0
     fi
     rm -f \"\$pidfile\"
-    start-stop-daemon --start --background --make-pidfile --pidfile \"\$pidfile\" --startas \"\$prefix/bin/yamd\" -- --data-dir \"\$prefix/data\"
+    start-stop-daemon --start --background --make-pidfile --pidfile \"\$pidfile\" --startas \"\$prefix/bin/yam-lua-runtime\" -- --data-dir \"\$prefix/data\"
     ;;
   stop)
     prefix=/data/quazar/yam
-    [ -f \"\$prefix/yamd.pid\" ] && kill \"\$(cat \"\$prefix/yamd.pid\")\" 2>/dev/null || true
-    rm -f \"\$prefix/yamd.pid\"
+    [ -f \"\$prefix/yam-lua-runtime.pid\" ] && kill \"\$(cat \"\$prefix/yam-lua-runtime.pid\")\" 2>/dev/null || true
+    rm -f \"\$prefix/yam-lua-runtime.pid\"
     ;;
 esac
 EOF
   chmod 0755 $INIT_SCRIPT" </dev/null
 
 echo "YAM $VERSION CLI installed in $BIN_DIR/yam"
-echo "yamd deployed to $DEVICE ($DEVICE_PREFIX). Open http://$STATION_IP:8099"
-echo "yamd is configured to start automatically after the speaker reboots."
+echo "yam-lua-runtime deployed to $DEVICE ($DEVICE_PREFIX)."
+echo "yam-lua-runtime is configured to start automatically after the speaker reboots."

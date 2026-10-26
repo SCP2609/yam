@@ -54,9 +54,26 @@ jobs:
           name: yam-aarch64-apple-darwin
           path: target/release/yam
 
+  lua-runtime:
+    name: Build Lua runtime host
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build AArch64 musl runtime
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE":/home/rust/src
+          -w /home/rust/src/packages/yam-lua-runtime
+          messense/rust-musl-cross:aarch64-musl
+          cargo build --release --locked --bin yam-lua-runtime
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yam-lua-runtime-aarch64-linux-musl
+          path: packages/yam-lua-runtime/target/aarch64-unknown-linux-musl/release/yam-lua-runtime
+
   release:
     name: Build and publish release
-    needs: [windows, linux-cli, macos-arm64]
+    needs: [windows, linux-cli, macos-arm64, lua-runtime]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -93,18 +110,13 @@ jobs:
           cargo fmt --check
           cargo test --locked
           sh -n install.sh
-      - name: Build AArch64 musl release binaries
-        run: >-
-          docker run --rm
-          -v "$GITHUB_WORKSPACE":/home/rust/src
-          -w /home/rust/src
-          messense/rust-musl-cross:aarch64-musl
-          cargo build --release --locked --bin yamd
       - name: Package assets and checksums
         run: |
           mkdir -p dist
-          cp target/aarch64-unknown-linux-musl/release/yamd "dist/yamd-aarch64-linux-musl"
-          chmod 0755 dist/yamd-aarch64-linux-musl
+      - uses: actions/download-artifact@v4
+        with:
+          name: yam-lua-runtime-aarch64-linux-musl
+          path: dist/runtime
       - uses: actions/download-artifact@v4
         with:
           name: yam-x86_64-pc-windows-msvc
@@ -119,14 +131,16 @@ jobs:
           path: dist/macos
       - name: Create checksums
         run: |
+          mv dist/runtime/yam-lua-runtime dist/yam-lua-runtime-aarch64-linux-musl
+          chmod 0755 dist/yam-lua-runtime-aarch64-linux-musl
           mv dist/windows/yam.exe dist/yam-x86_64-pc-windows-msvc.exe
           mv dist/linux/yam dist/yam-x86_64-unknown-linux-musl
           mv dist/macos/yam dist/yam-aarch64-apple-darwin
-          (cd dist && sha256sum yamd-aarch64-linux-musl yam-x86_64-unknown-linux-musl yam-aarch64-apple-darwin yam-x86_64-pc-windows-msvc.exe > SHA256SUMS)
+          (cd dist && sha256sum yam-lua-runtime-aarch64-linux-musl yam-x86_64-unknown-linux-musl yam-aarch64-apple-darwin yam-x86_64-pc-windows-msvc.exe > SHA256SUMS)
       - name: Create GitHub release
         run: |
           gh release create "${{ steps.version.outputs.tag }}" \
-            dist/yamd-aarch64-linux-musl \
+            dist/yam-lua-runtime-aarch64-linux-musl \
             dist/yam-x86_64-unknown-linux-musl \
             dist/yam-aarch64-apple-darwin \
             dist/yam-x86_64-pc-windows-msvc.exe \

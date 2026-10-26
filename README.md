@@ -9,4 +9,8 @@ YAM is a package manager for Yandex Stations.
 - Package format and CLI: [docs/V2_PACKAGE_MANAGER.md](docs/V2_PACKAGE_MANAGER.md)
 
 The project contains no embedded web UI, hardware runtime, Lua runtime, or
-legacy `.yap` compatibility layer. Those are independent host packages.
+legacy `.yap` compatibility layer in its core.
+
+`packages/yam-lua-runtime/` is an independent host package. It owns the Lua,
+Quasar, web and `.yap`/`plugin.toml` compatibility surface; the `yam` core
+never reads or authorizes those files.

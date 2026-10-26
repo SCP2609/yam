@@ -28,7 +28,7 @@ if ($Uninstall) {
     if ($adb) {
         $serial = Select-StationSerial
         if ($serial) {
-            & adb -s $serial shell 'set -eu; mount -o remount,rw /; trap "mount -o remount,ro /" EXIT; rm -f /etc/init.d/S99yam; if [ -f /data/quazar/yam/yamd.pid ] && kill -0 $(cat /data/quazar/yam/yamd.pid) 2>/dev/null; then kill $(cat /data/quazar/yam/yamd.pid); fi; rm -rf /data/quazar/yam' | Out-Null
+            & adb -s $serial shell 'set -eu; mount -o remount,rw /; trap "mount -o remount,ro /" EXIT; rm -f /etc/init.d/S99yam; if [ -f /data/quazar/yam/yam-lua-runtime.pid ] && kill -0 $(cat /data/quazar/yam/yam-lua-runtime.pid) 2>/dev/null; then kill $(cat /data/quazar/yam/yam-lua-runtime.pid); fi; rm -rf /data/quazar/yam' | Out-Null
         }
     }
     if (Test-Path $Prefix) { Remove-Item -Force -Recurse $Prefix }
@@ -96,7 +96,7 @@ try {
     New-Item -ItemType Directory -Force -Path $tmp, $binDir | Out-Null
     $checksums = Get-ReleaseAsset "SHA256SUMS"
     $downloads = @{}
-    foreach ($name in @("yam-x86_64-pc-windows-msvc.exe", "yamd-aarch64-linux-musl")) {
+    foreach ($name in @("yam-x86_64-pc-windows-msvc.exe", "yam-lua-runtime-aarch64-linux-musl")) {
         $download = Get-ReleaseAsset $name
         $expected = ((Get-Content $checksums | Where-Object { $_ -match ("\s" + [regex]::Escape($name) + "$") }) -split "\s+")[0]
         if (-not $expected) { throw "No SHA-256 checksum for $name" }
@@ -111,7 +111,7 @@ try {
         throw "Yandex Station IP address is required. Set `$env:YAM_STATION_IP or run the installer with -StationIp <address>."
     }
     $adb = Get-Command adb -ErrorAction SilentlyContinue
-    if (-not $adb) { throw "adb is required to deploy yamd to the Yandex Station" }
+    if (-not $adb) { throw "adb is required to deploy yam-lua-runtime to the Yandex Station" }
     $serial = $script:yamStationSerial
     if (-not $serial) {
         & adb connect "$stationIp`:5555" | Out-Host
@@ -119,27 +119,27 @@ try {
         & adb -s $serial get-state | Out-Null
     }
     $devicePrefix = "/data/quazar/yam"
-    $yamdBinary = $downloads["yamd-aarch64-linux-musl"]
+    $runtimeBinary = $downloads["yam-lua-runtime-aarch64-linux-musl"]
     & adb -s $serial shell "mkdir -p $devicePrefix/bin $devicePrefix/data" | Out-Null
-    & adb -s $serial push $yamdBinary "$devicePrefix/bin/yamd.new" | Out-Null
-    $startCommand = 'chmod 0755 /data/quazar/yam/bin/yamd.new; if [ -f /data/quazar/yam/yamd.pid ] && kill -0 $(cat /data/quazar/yam/yamd.pid) 2>/dev/null; then kill $(cat /data/quazar/yam/yamd.pid); fi; mv /data/quazar/yam/bin/yamd.new /data/quazar/yam/bin/yamd; start-stop-daemon --start --background --make-pidfile --pidfile /data/quazar/yam/yamd.pid --startas /data/quazar/yam/bin/yamd -- --data-dir /data/quazar/yam/data'
+    & adb -s $serial push $runtimeBinary "$devicePrefix/bin/yam-lua-runtime.new" | Out-Null
+    $startCommand = 'chmod 0755 /data/quazar/yam/bin/yam-lua-runtime.new; if [ -f /data/quazar/yam/yam-lua-runtime.pid ] && kill -0 $(cat /data/quazar/yam/yam-lua-runtime.pid) 2>/dev/null; then kill $(cat /data/quazar/yam/yam-lua-runtime.pid); fi; mv /data/quazar/yam/bin/yam-lua-runtime.new /data/quazar/yam/bin/yam-lua-runtime; start-stop-daemon --start --background --make-pidfile --pidfile /data/quazar/yam/yam-lua-runtime.pid --startas /data/quazar/yam/bin/yam-lua-runtime -- --data-dir /data/quazar/yam/data'
     & adb -s $serial shell $startCommand | Out-Null
     $bootScript = @'
 #!/bin/sh
 case "${1:-}" in
   start)
     prefix=/data/quazar/yam
-    pidfile="$prefix/yamd.pid"
-    [ -x "$prefix/bin/yamd" ] || exit 0
+    pidfile="$prefix/yam-lua-runtime.pid"
+    [ -x "$prefix/bin/yam-lua-runtime" ] || exit 0
     mkdir -p "$prefix/data"
     if [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null; then exit 0; fi
     rm -f "$pidfile"
-    start-stop-daemon --start --background --make-pidfile --pidfile "$pidfile" --startas "$prefix/bin/yamd" -- --data-dir "$prefix/data"
+    start-stop-daemon --start --background --make-pidfile --pidfile "$pidfile" --startas "$prefix/bin/yam-lua-runtime" -- --data-dir "$prefix/data"
     ;;
   stop)
     prefix=/data/quazar/yam
-    [ -f "$prefix/yamd.pid" ] && kill "$(cat "$prefix/yamd.pid")" 2>/dev/null || true
-    rm -f "$prefix/yamd.pid"
+    [ -f "$prefix/yam-lua-runtime.pid" ] && kill "$(cat "$prefix/yam-lua-runtime.pid")" 2>/dev/null || true
+    rm -f "$prefix/yam-lua-runtime.pid"
     ;;
 esac
 '@
@@ -147,12 +147,8 @@ esac
     $bootCommand = "set -eu; mount -o remount,rw /; trap 'mount -o remount,ro /' EXIT; echo '$bootScript64' | base64 -d > /etc/init.d/S99yam; chmod 0755 /etc/init.d/S99yam"
     & adb -s $serial shell $bootCommand | Out-Null
 
-    $yamUrl = "http://$stationIp`:8099"
-    [Environment]::SetEnvironmentVariable("YAM_URL", $yamUrl, "User")
-    $env:YAM_URL = $yamUrl
-    @"
+        @"
 @echo off
-if not defined YAM_URL set "YAM_URL=$yamUrl"
 "%~dp0yam-bin.exe" %*
 "@ | Set-Content -Encoding ascii $yamCommand
 
@@ -162,8 +158,8 @@ $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     }
     $env:Path = "$binDir;$env:Path"
     Write-Host "YAM $tag installed in $Prefix and deployed to $stationIp"
-    Write-Host "yamd is configured to start automatically after the speaker reboots."
-    Write-Host "Use yam list or yam --url $yamUrl list"
+    Write-Host "yam-lua-runtime is configured to start automatically after the speaker reboots."
+    Write-Host "Use yam --platform <platform> list to inspect v2 packages."
 } finally {
     if (Test-Path $tmp) { Remove-Item -Force -Recurse $tmp }
 }

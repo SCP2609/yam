@@ -25,6 +25,8 @@ jobs:
         run: cargo test --locked
       - name: Check default build
         run: cargo check --locked
+      - name: Check Lua runtime host
+        run: cargo check --manifest-path packages/yam-lua-runtime/Cargo.toml --locked
   aarch64-musl:
     name: Build AArch64 musl manager
     runs-on: ubuntu-latest
