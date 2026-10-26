@@ -608,6 +608,44 @@ impl Manager {
         Ok(problems)
     }
 
+    /// Restore only common-tree links that are recorded in YAM's state.
+    /// Unowned files are never removed or replaced.
+    pub fn repair(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT path,target FROM links ORDER BY path")?;
+        let links = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let payload_root = self.root.join("pkgs");
+        let mut repaired = Vec::new();
+        for (path, target) in links {
+            validate_payload_path(&path)?;
+            let link = self.root.join(&path);
+            let target = PathBuf::from(target);
+            if !target.starts_with(&payload_root) || !target.is_file() {
+                bail!("cannot repair {path}: recorded payload is missing")
+            }
+            if fs::read_link(&link).ok().as_ref() == Some(&target) {
+                continue;
+            }
+            if link.exists() && !link.is_symlink() {
+                bail!("cannot repair {path}: it is not a YAM link")
+            }
+            if link.is_symlink() {
+                fs::remove_file(&link)?;
+            }
+            if let Some(parent) = link.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            make_link(&link, &target)?;
+            repaired.push(path);
+        }
+        Ok(repaired)
+    }
+
     pub fn entware_available(&self) -> bool {
         self.profile
             .entware

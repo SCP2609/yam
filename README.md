@@ -25,6 +25,8 @@ irm https://hackalice.me/install.ps1 | iex
 yam --platform yandexmicro list
 yam --platform yandexmicro search namespace/package
 yam --platform yandexmicro install namespace/package
+yam --platform yandexmicro doctor
+yam --platform yandexmicro repair
 ```
 
 Для локальной проверки пакета укажите отдельный каталог:

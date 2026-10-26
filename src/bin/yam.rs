@@ -51,6 +51,7 @@ enum Command {
         path: String,
     },
     Doctor,
+    Repair,
     Entware {
         #[command(subcommand)]
         command: EntwareCommand,
@@ -138,6 +139,16 @@ fn main() -> Result<()> {
                             eprintln!("problem: {problem}");
                         }
                         bail!("doctor found inconsistencies")
+                    }
+                }
+                Command::Repair => {
+                    let repaired = manager.repair()?;
+                    if repaired.is_empty() {
+                        println!("Nothing to repair.");
+                    } else {
+                        for path in repaired {
+                            println!("Repaired {path}.");
+                        }
                     }
                 }
                 Command::Entware { command } => match command {

@@ -33,6 +33,9 @@ yam --platform yandexmicro --root ./test-root install --yes hello.yampkg
 yam --platform yandexmicro --root ./test-root doctor
 ```
 
+`repair` восстанавливает только ссылки, известные YAM; чужие файлы он не
+заменяет.
+
 ## Зависимости
 
 ```yaml
