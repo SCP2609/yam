@@ -5,6 +5,7 @@ use std::{
     io::Read,
     path::{Component, Path, PathBuf},
 };
+use yam::v2::registry;
 use yam::v2::{Manager, PlatformProfile};
 
 #[derive(Parser)]
@@ -19,6 +20,9 @@ struct Cli {
     /// Override the profile's persistent package root (useful for development).
     #[arg(long, env = "YAM_ROOT")]
     root: Option<PathBuf>,
+    /// Configured registry used by package-name installation.
+    #[arg(long, default_value = "official")]
+    registry: String,
     #[command(subcommand)]
     command: Command,
 }
@@ -31,7 +35,7 @@ enum Command {
         output: PathBuf,
     },
     Install {
-        artifact: PathBuf,
+        package: String,
         #[arg(short = 'y', long)]
         yes: bool,
     },
@@ -50,6 +54,16 @@ enum Command {
         #[command(subcommand)]
         command: EntwareCommand,
     },
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommand,
+    },
+    Search {
+        query: String,
+    },
+    Info {
+        name: String,
+    },
     /// Convert a legacy .yap archive into a reviewable v2 source tree.
     ConvertYap {
         archive: PathBuf,
@@ -65,6 +79,19 @@ enum Command {
 enum EntwareCommand {
     Status,
     List,
+}
+#[derive(Subcommand)]
+enum RegistryCommand {
+    List,
+    Add {
+        name: String,
+        url: String,
+        #[arg(long)]
+        key: String,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -85,8 +112,23 @@ fn main() -> Result<()> {
             let root = cli.root.unwrap_or_else(|| profile.paths.root.clone());
             let mut manager = Manager::open(root, profile)?;
             match command {
-                Command::Install { artifact, yes } => {
-                    let manifest = manager.install(&artifact, yes)?;
+                Command::Install { package, yes } => {
+                    let manifest = if Path::new(&package).is_file() {
+                        manager.install(Path::new(&package), yes)?
+                    } else {
+                        let (name, version) = split_package_version(&package)?;
+                        let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+                        let index = registry::package_index(&selected, name)?;
+                        let (_, artifact) =
+                            registry::select_artifact(&index, version, manager.profile())?;
+                        let bytes = registry::download_artifact(&selected, &artifact)?;
+                        let temporary =
+                            manager_root(&manager).join(".staging/registry-download.yampkg");
+                        fs::write(&temporary, bytes)?;
+                        let result = manager.install(&temporary, yes);
+                        let _ = fs::remove_file(&temporary);
+                        result?
+                    };
                     println!(
                         "Installed {} {} for {}.",
                         manifest.name, manifest.version, manifest.target
@@ -132,6 +174,48 @@ fn main() -> Result<()> {
                     ),
                     EntwareCommand::List => print!("{}", manager.entware_list()?),
                 },
+                Command::Registry { command } => match command {
+                    RegistryCommand::List => {
+                        for (name, entry) in
+                            registry::load_config(&manager_root(&manager))?.registries
+                        {
+                            println!("{name}\t{}", entry.url);
+                        }
+                    }
+                    RegistryCommand::Add { name, url, key } => {
+                        registry::add_registry(&manager_root(&manager), &name, &url, &key)?;
+                        println!("Added registry {name}.");
+                    }
+                    RegistryCommand::Remove { name } => {
+                        registry::remove_registry(&manager_root(&manager), &name)?;
+                        println!("Removed registry {name}.");
+                    }
+                },
+                Command::Search { query } => {
+                    let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+                    for package in
+                        registry::catalogue(&selected)?
+                            .packages
+                            .into_iter()
+                            .filter(|entry| {
+                                entry.name.contains(&query)
+                                    || entry.summary.to_lowercase().contains(&query.to_lowercase())
+                                    || entry
+                                        .keywords
+                                        .iter()
+                                        .any(|keyword| keyword.contains(&query))
+                            })
+                    {
+                        println!("{}\t{}\t{}", package.name, package.latest, package.summary);
+                    }
+                }
+                Command::Info { name } => {
+                    let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&registry::package_index(&selected, &name)?)?
+                    );
+                }
                 Command::Pack { .. } | Command::ConvertYap { .. } | Command::Legacy { .. } => {
                     unreachable!()
                 }
@@ -139,6 +223,18 @@ fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+fn manager_root(manager: &Manager) -> PathBuf {
+    manager.root().to_path_buf()
+}
+fn split_package_version(value: &str) -> Result<(&str, Option<&str>)> {
+    let (name, version) = value
+        .rsplit_once('@')
+        .map_or((value, None), |(name, version)| (name, Some(version)));
+    if name.is_empty() || version.is_some_and(str::is_empty) {
+        bail!("package name must be name or name@version")
+    }
+    Ok((name, version))
 }
 
 fn convert_yap(archive: &Path, output: &Path) -> Result<()> {

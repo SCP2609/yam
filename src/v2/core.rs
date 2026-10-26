@@ -179,6 +179,9 @@ impl Manager {
     pub fn profile(&self) -> &PlatformProfile {
         &self.profile
     }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
     pub fn pack(source_dir: &Path, profile: &PlatformProfile, output: &Path) -> Result<()> {
         let descriptor = source_dir.join("yam.yaml");
