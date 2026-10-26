@@ -939,6 +939,44 @@ fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
             bail!("invalid SHA-256 for {path}")
         }
     }
+    for (name, service) in &manifest.services {
+        validate_service(name, service, &manifest.files_sha256)?;
+    }
+    Ok(())
+}
+fn validate_service(
+    name: &str,
+    service: &ServiceSpec,
+    payload: &BTreeMap<String, String>,
+) -> Result<()> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("invalid service name {name:?}")
+    }
+    let executable = service
+        .exec
+        .first()
+        .context("service exec must not be empty")?;
+    validate_payload_path(executable)?;
+    if !payload.contains_key(executable) {
+        bail!("service {name:?} executable is not a package payload: {executable}")
+    }
+    if service.exec.iter().any(|argument| argument.contains('\0')) {
+        bail!("service {name:?} contains a NUL argument")
+    }
+    for (key, value) in &service.env {
+        if key.is_empty()
+            || !key
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || value.contains('\0')
+        {
+            bail!("invalid environment entry for service {name:?}")
+        }
+    }
     Ok(())
 }
 
