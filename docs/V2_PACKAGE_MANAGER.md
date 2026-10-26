@@ -56,8 +56,9 @@ profiles, a legacy converter, and opt-in Entware detection.
 
 Registry-backed dependency acquisition, service supervision, hooks, triggers,
 configuration merging, rollback and system overrides are intentionally not yet
-implemented. A required dependency must already be installed; unresolved
-requirements are rejected rather than being partially installed.
+implemented. Static registry search, info and explicit package installation are
+available; a required dependency must still already be installed, because the
+registry graph resolver is not implemented yet.
 
 ## Legacy conversion
 
