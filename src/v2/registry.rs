@@ -209,29 +209,33 @@ pub fn download_artifact(registry: &Registry, artifact: &Artifact) -> Result<Vec
 pub fn resolve(
     registry: &Registry,
     requested: &str,
+    requested_version: Option<&str>,
     profile: &PlatformProfile,
 ) -> Result<Vec<ResolvedPackage>> {
-    let mut resolved = BTreeMap::new();
+    let mut resolved = Vec::new();
+    let mut completed = BTreeSet::new();
     let mut visiting = BTreeSet::new();
     resolve_one(
         registry,
         requested,
-        None,
+        requested_version,
         profile,
         &mut resolved,
+        &mut completed,
         &mut visiting,
     )?;
-    Ok(resolved.into_values().collect())
+    Ok(resolved)
 }
 fn resolve_one(
     registry: &Registry,
     name: &str,
     requested_version: Option<&str>,
     profile: &PlatformProfile,
-    resolved: &mut BTreeMap<String, ResolvedPackage>,
+    resolved: &mut Vec<ResolvedPackage>,
+    completed: &mut BTreeSet<String>,
     visiting: &mut BTreeSet<String>,
 ) -> Result<()> {
-    if resolved.contains_key(name) {
+    if completed.contains(name) {
         return Ok(());
     }
     if !name.contains('/') {
@@ -256,18 +260,17 @@ fn resolve_one(
             Some(&selected),
             profile,
             resolved,
+            completed,
             visiting,
         )?;
     }
     visiting.remove(name);
-    resolved.insert(
-        name.into(),
-        ResolvedPackage {
-            name: name.into(),
-            version,
-            artifact,
-        },
-    );
+    completed.insert(name.into());
+    resolved.push(ResolvedPackage {
+        name: name.into(),
+        version,
+        artifact,
+    });
     Ok(())
 }
 fn split_requirement(value: &str) -> Result<(&str, Vec<&str>)> {

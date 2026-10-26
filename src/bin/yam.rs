@@ -1,10 +1,12 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use std::{
+    collections::BTreeMap,
     fs,
     io::Read,
     path::{Component, Path, PathBuf},
 };
+use uuid::Uuid;
 use yam::v2::registry;
 use yam::v2::{Manager, PlatformProfile};
 
@@ -122,16 +124,7 @@ fn main() -> Result<()> {
                     } else {
                         let (name, version) = split_package_version(&package)?;
                         let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
-                        let index = registry::package_index(&selected, name)?;
-                        let (_, artifact) =
-                            registry::select_artifact(&index, version, manager.profile())?;
-                        let bytes = registry::download_artifact(&selected, &artifact)?;
-                        let temporary =
-                            manager_root(&manager).join(".staging/registry-download.yampkg");
-                        fs::write(&temporary, bytes)?;
-                        let result = manager.install(&temporary, yes);
-                        let _ = fs::remove_file(&temporary);
-                        result?
+                        install_registry_graph(&mut manager, &selected, name, version, yes)?
                     };
                     println!(
                         "Installed {} {} for {}.",
@@ -223,16 +216,7 @@ fn main() -> Result<()> {
                 Command::Plan { package } => {
                     let (name, version) = split_package_version(&package)?;
                     let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
-                    let packages = registry::resolve(&selected, name, manager.profile())?;
-                    if let Some(version) = version {
-                        let root = packages.last().context("empty registry plan")?;
-                        if root.version != version {
-                            bail!(
-                                "requested {name}@{version}, registry selected {}",
-                                root.version
-                            )
-                        }
-                    }
+                    let packages = registry::resolve(&selected, name, version, manager.profile())?;
                     for package in packages {
                         println!(
                             "{}\t{}\t{}",
@@ -250,6 +234,73 @@ fn main() -> Result<()> {
 }
 fn manager_root(manager: &Manager) -> PathBuf {
     manager.root().to_path_buf()
+}
+fn install_registry_graph(
+    manager: &mut Manager,
+    registry_config: &registry::Registry,
+    name: &str,
+    version: Option<&str>,
+    yes: bool,
+) -> Result<yam::v2::PackageManifest> {
+    let graph = registry::resolve(registry_config, name, version, manager.profile())?;
+    let installed = manager
+        .list()?
+        .into_iter()
+        .map(|package| (package.name, package.version))
+        .collect::<BTreeMap<_, _>>();
+    let download_dir = manager
+        .root()
+        .join(".staging")
+        .join(format!("registry-{}", Uuid::new_v4()));
+    fs::create_dir_all(&download_dir)?;
+    let downloaded = (|| -> Result<Vec<(registry::ResolvedPackage, PathBuf)>> {
+        graph
+            .into_iter()
+            .enumerate()
+            .map(|(index, package)| {
+                let bytes = registry::download_artifact(registry_config, &package.artifact)?;
+                let path = download_dir.join(format!("{index}.yampkg"));
+                fs::write(&path, bytes)?;
+                Ok((package, path))
+            })
+            .collect()
+    })();
+    let downloaded = match downloaded {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&download_dir);
+            return Err(error);
+        }
+    };
+    let mut newly_installed = Vec::new();
+    let mut root_manifest = None;
+    for (package, artifact) in downloaded {
+        if installed
+            .get(&package.name)
+            .is_some_and(|current| current == &package.version)
+        {
+            continue;
+        }
+        match manager.install(&artifact, yes) {
+            Ok(manifest) => {
+                if !installed.contains_key(&manifest.name) {
+                    newly_installed.push(manifest.name.clone());
+                }
+                if manifest.name == name {
+                    root_manifest = Some(manifest);
+                }
+            }
+            Err(error) => {
+                for installed in newly_installed.into_iter().rev() {
+                    let _ = manager.remove(&installed);
+                }
+                let _ = fs::remove_dir_all(&download_dir);
+                return Err(error.context("registry graph installation failed; newly installed dependencies were rolled back"));
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&download_dir);
+    root_manifest.context("requested package was already installed or absent from registry plan")
 }
 fn split_package_version(value: &str) -> Result<(&str, Option<&str>)> {
     let (name, version) = value

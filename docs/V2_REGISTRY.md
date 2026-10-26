@@ -79,6 +79,12 @@ dependency-first order without changing disk state. A virtual dependency needs
 the registry's provider-selection policy and is rejected until that policy is
 part of the index contract.
 
+`yam install name` uses the same graph: it downloads and hash-verifies every
+artifact before installing the first one, then applies dependencies before the
+requested package. If a first-install dependency fails later in the graph, YAM
+removes the newly installed dependencies. Full filesystem/database atomicity
+for upgrades is still part of the transaction-engine milestone.
+
 ## Trust model
 
 The design has three layers: HTTPS transport, a signature on canonical registry
