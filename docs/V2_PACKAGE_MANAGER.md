@@ -1,8 +1,9 @@
 # YAM v2 package manager
 
 YAM v2 is an incompatible package manager currently developed on the `v2`
-branch. Its package artifacts are `.yampkg`; it does not install legacy `.yap`
-archives or read `plugin.toml`.
+branch. Its package artifacts are `.yampkg`; the core does not install legacy
+`.yap` archives or read `plugin.toml`. Those formats belong exclusively to the
+separate `yam/lua-runtime` host package.
 
 ## Quick start
 
@@ -35,6 +36,9 @@ yam --platform yandexmicro --root ./yam-root install --yes hello-1.0.0-any.yampk
 Use `list`, `files <name>`, `which <path>`, `doctor`, and `remove <name>` to
 inspect package state.
 
+For an author-oriented source descriptor, relationship fields, target builds,
+services and publication checklist, see [PACKAGING.md](PACKAGING.md).
+
 ## Artifact rules
 
 - An artifact is a zstd-compressed tar file with extension `.yampkg`.
@@ -49,28 +53,26 @@ inspect package state.
 
 ## Current implementation boundary
 
-The first v2 increment implements packing, hash verification, safe extraction,
-SQLite ownership state, common-tree links, installed dependency/provides/conflict
-validation, removal protection for reverse dependencies, diagnostics, platform
-profiles, a legacy converter, and opt-in Entware detection.
+The current core implements packing, safe archive validation, SHA-256 payload
+verification, SQLite ownership state, common-tree links, installed dependency
+and conflict validation, reverse-dependency removal protection, diagnostics,
+platform profiles, opt-in Entware detection, and signed static registry
+metadata. Registry installation resolves concrete dependency graphs, verifies
+every download before the first filesystem change, then installs in
+dependency-first order.
 
-Registry-backed dependency acquisition, service supervision, hooks, triggers,
-configuration merging, rollback and system overrides are intentionally not yet
-implemented. Static registry search, info and explicit package installation are
-available; a required dependency must still already be installed, because the
-registry graph resolver is not implemented yet.
+Services are accepted as neutral manifest metadata (`exec` argument array,
+restart policy, ordering and environment). A platform supervisor and boot
+adapter, hooks/triggers, config merging, full upgrade rollback, autoremove and
+system overrides remain future work. `system_overrides` is deliberately not
+accepted.
 
-## Legacy conversion
+## Legacy plugin formats
 
-Use an explicit converter for a v1 archive:
-
-```sh
-yam --platform yandexmicro convert-yap old-plugin.yap converted-plugin
-```
-
-It extracts ordinary payload files and writes a reviewable `yam.yaml`.
-Review targets, package identity and runtime-specific metadata before packing.
-It does not import v1 permissions, launch configuration, hooks or services.
+There is no `convert-yap` command in the v2 core. The legacy `.yap` archive,
+`plugin.toml`, Lua permission model, Quasar API and APKG converter are owned by
+[`packages/yam-lua-runtime/`](../packages/yam-lua-runtime/). They are not v2
+package metadata and must not be added to `yam.yaml` or `MANIFEST.yaml`.
 
 ## Entware
 
