@@ -722,9 +722,37 @@ fn compatibility_error(m: &Manifest, d: &DeviceProfile) -> Option<String> {
         Some(format!("missing feature(s): {}", missing.join(", ")))
     }
 }
+/// Converts model identifiers from device-tree, CLI and package manifests into
+/// YAM's stable package-facing form (for example, `yandexmicro`).
+fn recognized_model(value: &str) -> Option<&'static str> {
+    let normalized = value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    const MODELS: [(&str, &str); 7] = [
+        ("yandexmicro", "yandexmicro"),
+        ("yandexcucumber", "yandexmidi"),
+        ("yandexplum", "yandexplum"),
+        ("yandexmini2", "yandexmini_2"),
+        ("stationmini2", "yandexmini_2"),
+        ("yandexstation2", "yandexstation_2"),
+        ("yandexmini", "yandexmini"),
+    ];
+    MODELS
+        .iter()
+        .find(|(needle, _)| normalized.contains(needle))
+        .map(|(_, model)| *model)
+}
+fn canonical_model(value: &str) -> String {
+    recognized_model(value)
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.trim().to_ascii_lowercase())
+}
 fn detect_device(root: &Path, forced: Option<String>) -> DeviceProfile {
     if let Ok(raw) = fs::read_to_string(root.join("device.toml")) {
-        if let Ok(p) = toml::from_str::<DeviceProfile>(&raw) {
+        if let Ok(mut p) = toml::from_str::<DeviceProfile>(&raw) {
+            p.model = canonical_model(&p.model);
             return p;
         }
     }
@@ -741,15 +769,6 @@ fn detect_device(root: &Path, forced: Option<String>) -> DeviceProfile {
     .to_lowercase();
     // Ring layout is the most reliable signal; device-tree strings cover the rest.
     // Mini 2 reports `yandex,station-mini2` in its device-tree compatible list.
-    const TEXT_MODELS: [(&str, &str); 7] = [
-        ("yandexmicro", "yandexmicro"),
-        ("yandex,cucumber", "yandexmidi"),
-        ("yandex,plum", "yandexplum"),
-        ("yandexmini_2", "yandexmini_2"),
-        ("station-mini2", "yandexmini_2"),
-        ("yandexstation_2", "yandexstation_2"),
-        ("yandexmini", "yandexmini"),
-    ];
     let model = forced.unwrap_or_else(|| {
         let by_leds = detect_led_profile(&default_led_root()).map(|(profile, _)| match profile {
             "micro" => "yandexmicro",
@@ -758,15 +777,11 @@ fn detect_device(root: &Path, forced: Option<String>) -> DeviceProfile {
             _ => "yandexmini_2",
         });
         by_leds
-            .or_else(|| {
-                TEXT_MODELS
-                    .iter()
-                    .find(|(needle, _)| text.contains(needle))
-                    .map(|(_, model)| *model)
-            })
+            .or_else(|| recognized_model(&text))
             .unwrap_or("unknown")
             .into()
     });
+    let model = canonical_model(&model);
     // LED ring features depend on the configured profile and are added in `main`.
     let mut features = vec!["runtime.lua.v1".into(), "plugin.yap.v1".into()];
     if command_exists("amixer") {
@@ -1937,6 +1952,41 @@ fn configured_rgb_ring(settings: &LedSettings) -> bool {
         .iter()
         .all(|channel| led_brightness_path(settings, channel, 0).is_ok_and(|p| p.exists()))
 }
+/// Returns whether the named speaker API is usable on this device. This is a
+/// capability probe, not a permission check: an unavailable API returns false,
+/// while an API omitted from a package's manifest remains inaccessible.
+fn lua_api_available(device: &DeviceProfile, name: &str) -> Result<bool> {
+    let has_feature = |feature: &str| device.features.iter().any(|value| value == feature);
+    let quasar_has = |service: &str| {
+        fs::read_to_string(QUASAR_CONFIG)
+            .ok()
+            .and_then(|config| quasar_service_port(&config, service).ok().flatten())
+            .is_some()
+    };
+    Ok(match name {
+        "led" => device
+            .features
+            .iter()
+            .any(|feature| feature.starts_with("led.")),
+        "volume" => has_feature("audio.volume.alsa"),
+        "audio" => has_feature("audio.play.aplay"),
+        "bluetooth" => has_feature("bluetooth.bluez"),
+        "display" => has_feature("display.backlight"),
+        "sensors" => device
+            .features
+            .iter()
+            .any(|feature| feature.starts_with("sensor.")),
+        "sensors.control" => has_feature("sensor.ambient_light.iio"),
+        "clock" => has_feature("display.clock.segment.v1"),
+        "input" => has_feature("input.evdev"),
+        "network" | "system" => true,
+        "ipc.alarm" => quasar_has("alarmd"),
+        "ipc.speech" | "commands" => quasar_has("aliced"),
+        "ipc.read" | "ipc.control" => Path::new(QUASAR_CONFIG).is_file(),
+        "exec" => bail!("exec has no is_available probe"),
+        _ => bail!("unknown speaker API {name:?}"),
+    })
+}
 
 async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBool>) -> Result<()> {
     let device = app.device.lock().await.clone();
@@ -1965,6 +2015,18 @@ async fn run_plugin(app: App, id: String, event: String, cancelled: Arc<AtomicBo
         let globals = lua.globals();
         let api = lua.create_table()?;
         let permissions: HashSet<_> = manifest.permissions.iter().map(String::as_str).collect();
+        let available_device = device.clone();
+        api.set(
+            "is_available",
+            lua.create_function(move |_, name: String| {
+                lua_api_available(&available_device, &name).map_err(mlua::Error::external)
+            })?,
+        )?;
+        let model = device.model.clone();
+        api.set(
+            "model",
+            lua.create_function(move |_, ()| Ok(model.clone()))?,
+        )?;
         let cancelled_sleep = cancelled.clone();
         api.set(
             "sleep",
@@ -3460,6 +3522,27 @@ mod tests {
         assert!(command_matches("ананас", "Алиса, ананас!"));
         assert!(command_matches("ананас", "ананас"));
         assert!(!command_matches("ананас", "алиса банан"));
+    }
+
+    #[test]
+    fn model_names_are_normalized_for_package_compatibility() {
+        assert_eq!(canonical_model("Yandex Micro"), "yandexmicro");
+        assert_eq!(canonical_model("yandex,micro"), "yandexmicro");
+        assert_eq!(canonical_model("yandex,station-mini2"), "yandexmini_2");
+    }
+
+    #[test]
+    fn availability_reports_device_capabilities_but_not_exec() {
+        let device = DeviceProfile {
+            model: "yandexmicro".into(),
+            architecture: "aarch64".into(),
+            features: vec!["led.ring.rgb".into(), "audio.play.aplay".into()],
+            source: "test".into(),
+        };
+        assert!(lua_api_available(&device, "led").unwrap());
+        assert!(lua_api_available(&device, "audio").unwrap());
+        assert!(!lua_api_available(&device, "bluetooth").unwrap());
+        assert!(lua_api_available(&device, "exec").is_err());
     }
 
     #[test]
