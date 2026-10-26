@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
@@ -161,6 +161,16 @@ impl Manager {
              CREATE TABLE IF NOT EXISTS links (
                path TEXT PRIMARY KEY, package_name TEXT NOT NULL REFERENCES packages(name) ON DELETE CASCADE,
                target TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS provides (
+               capability TEXT NOT NULL,
+               package_name TEXT NOT NULL REFERENCES packages(name) ON DELETE CASCADE,
+               PRIMARY KEY(capability, package_name)
+             );
+             CREATE TABLE IF NOT EXISTS dependencies (
+               package_name TEXT NOT NULL REFERENCES packages(name) ON DELETE CASCADE,
+               requirement TEXT NOT NULL,
+               PRIMARY KEY(package_name, requirement)
              );",
         )?;
         Ok(Self { root, profile, db })
@@ -284,15 +294,7 @@ impl Manager {
                 self.profile.arch
             )
         }
-        if !manifest.depends.is_empty()
-            || !manifest.recommends.is_empty()
-            || !manifest.enhances.is_empty()
-            || !manifest.provides.is_empty()
-            || !manifest.conflicts.is_empty()
-            || !manifest.replaces.is_empty()
-        {
-            bail!("dependency resolution is not implemented yet; refusing a partial install")
-        }
+        self.validate_relations(&manifest)?;
         if manifest
             .entware
             .as_ref()
@@ -385,6 +387,27 @@ impl Manager {
             "DELETE FROM package_files WHERE package_name=?1",
             [&manifest.name],
         )?;
+        transaction.execute(
+            "DELETE FROM provides WHERE package_name=?1",
+            [&manifest.name],
+        )?;
+        transaction.execute(
+            "DELETE FROM dependencies WHERE package_name=?1",
+            [&manifest.name],
+        )?;
+        for capability in &manifest.provides {
+            validate_capability(capability)?;
+            transaction.execute(
+                "INSERT INTO provides(capability,package_name) VALUES(?1,?2)",
+                params![capability, manifest.name],
+            )?;
+        }
+        for requirement in &manifest.depends {
+            transaction.execute(
+                "INSERT INTO dependencies(package_name,requirement) VALUES(?1,?2)",
+                params![manifest.name, requirement],
+            )?;
+        }
         transaction.execute("DELETE FROM links WHERE package_name=?1", [&manifest.name])?;
         transaction.execute(
             "INSERT INTO packages(name,version,target,payload_path) VALUES(?1,?2,?3,?4)
@@ -458,6 +481,38 @@ impl Manager {
 
     pub fn remove(&mut self, name: &str) -> Result<()> {
         validate_name(name)?;
+        let capabilities = {
+            let mut statement = self
+                .db
+                .prepare("SELECT capability FROM provides WHERE package_name=?1")?;
+            let values = statement
+                .query_map([name], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<HashSet<_>>>()?;
+            values
+        };
+        let dependents = {
+            let mut statement = self.db.prepare(
+                "SELECT package_name,requirement FROM dependencies WHERE package_name != ?1",
+            )?;
+            let dependents = statement
+                .query_map([name], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .filter_map(Result::ok)
+                .filter(|(_, requirement)| {
+                    requirement_name(requirement)
+                        .is_ok_and(|required| required == name || capabilities.contains(required))
+                })
+                .map(|(package, _)| package)
+                .collect::<Vec<_>>();
+            dependents
+        };
+        if !dependents.is_empty() {
+            bail!(
+                "cannot remove {name}; required by {}",
+                dependents.join(", ")
+            )
+        }
         let payload: String = self
             .db
             .query_row(
@@ -575,6 +630,161 @@ impl Manager {
         }
         Ok(())
     }
+
+    fn validate_relations(&self, manifest: &PackageManifest) -> Result<()> {
+        if !manifest.replaces.is_empty() {
+            bail!("replaces is not implemented yet; refusing a partial install")
+        }
+        for requirement in &manifest.depends {
+            let (name, constraints) = parse_requirement(requirement)?;
+            if !self.requirement_satisfied(name, &constraints)? {
+                bail!(
+                    "unsatisfied dependency {requirement} required by {}",
+                    manifest.name
+                )
+            }
+        }
+        for conflict in &manifest.conflicts {
+            let (name, constraints) = parse_requirement(conflict)?;
+            if self.requirement_satisfied(name, &constraints)? && name != manifest.name {
+                bail!(
+                    "{} conflicts with installed package or capability {conflict}",
+                    manifest.name
+                )
+            }
+        }
+        Ok(())
+    }
+
+    fn requirement_satisfied(&self, name: &str, constraints: &[VersionConstraint]) -> Result<bool> {
+        let mut statement = self.db.prepare(
+            "SELECT p.name,p.version FROM packages p WHERE p.name=?1
+             UNION SELECT p.name,p.version FROM packages p JOIN provides v ON v.package_name=p.name WHERE v.capability=?1",
+        )?;
+        let candidates = statement
+            .query_map([name], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (_, version) in candidates {
+            let version = Version::parse(&version)?;
+            if constraints
+                .iter()
+                .all(|constraint| constraint.matches(&version))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[derive(Debug)]
+enum VersionConstraint {
+    Equal(Version),
+    AtLeast(Version),
+    LessThan(Version),
+    Caret(Version),
+    Tilde(Version),
+}
+#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct Version {
+    major: u64,
+    minor: u64,
+    patch: u64,
+    pre: Option<String>,
+}
+impl Version {
+    fn parse(value: &str) -> Result<Self> {
+        validate_version(value)?;
+        let (main, _) = value
+            .split_once('+')
+            .map_or((value, None), |(main, build)| (main, Some(build)));
+        let (main, pre) = main
+            .split_once('-')
+            .map_or((main, None), |(main, pre)| (main, Some(pre)));
+        let values = main
+            .split('.')
+            .map(str::parse)
+            .collect::<std::result::Result<Vec<u64>, _>>()?;
+        Ok(Self {
+            major: values[0],
+            minor: values[1],
+            patch: values[2],
+            pre: pre.map(str::to_owned),
+        })
+    }
+}
+impl VersionConstraint {
+    fn matches(&self, version: &Version) -> bool {
+        match self {
+            Self::Equal(expected) => version == expected,
+            Self::AtLeast(expected) => version >= expected,
+            Self::LessThan(expected) => version < expected,
+            Self::Caret(expected) => {
+                version >= expected
+                    && (version.major == expected.major
+                        && (expected.major != 0 || version.minor == expected.minor))
+            }
+            Self::Tilde(expected) => {
+                version >= expected
+                    && version.major == expected.major
+                    && version.minor == expected.minor
+            }
+        }
+    }
+}
+fn parse_requirement(value: &str) -> Result<(&str, Vec<VersionConstraint>)> {
+    let mut words = value.split_whitespace();
+    let name = words.next().context("empty package requirement")?;
+    validate_capability(name)?;
+    let constraints = words.map(parse_constraint).collect::<Result<Vec<_>>>()?;
+    Ok((name, constraints))
+}
+fn requirement_name(value: &str) -> Result<&str> {
+    Ok(parse_requirement(value)?.0)
+}
+fn parse_constraint(value: &str) -> Result<VersionConstraint> {
+    let (operator, version) = [">=", "^", "~", "=", "<"]
+        .iter()
+        .find_map(|operator| {
+            value
+                .strip_prefix(operator)
+                .map(|version| (*operator, version))
+        })
+        .context("invalid version constraint")?;
+    let version = Version::parse(&normalize_constraint_version(version)?)?;
+    Ok(match operator {
+        ">=" => VersionConstraint::AtLeast(version),
+        "<" => VersionConstraint::LessThan(version),
+        "^" => VersionConstraint::Caret(version),
+        "~" => VersionConstraint::Tilde(version),
+        "=" => VersionConstraint::Equal(version),
+        _ => unreachable!(),
+    })
+}
+fn normalize_constraint_version(value: &str) -> Result<String> {
+    let (main, suffix) = value
+        .split_once('-')
+        .map_or((value, None), |(main, suffix)| (main, Some(suffix)));
+    let parts = main.split('.').collect::<Vec<_>>();
+    if parts.is_empty()
+        || parts.len() > 3
+        || !parts
+            .iter()
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        bail!("invalid constraint version {value:?}")
+    }
+    let mut normalized = parts.join(".");
+    for _ in parts.len()..3 {
+        normalized.push_str(".0");
+    }
+    if let Some(suffix) = suffix {
+        normalized.push('-');
+        normalized.push_str(suffix);
+    }
+    Ok(normalized)
 }
 
 fn insert_payload(
@@ -670,6 +880,20 @@ fn validate_name(name: &str) -> Result<()> {
         {
             bail!("invalid package name {name:?}")
         }
+    }
+    Ok(())
+}
+fn validate_capability(value: &str) -> Result<()> {
+    if value.contains('/') {
+        return validate_name(value);
+    }
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        bail!("invalid package capability {value:?}")
     }
     Ok(())
 }

@@ -50,13 +50,14 @@ inspect package state.
 ## Current implementation boundary
 
 The first v2 increment implements packing, hash verification, safe extraction,
-SQLite ownership state, common-tree links, removal, diagnostics, platform
+SQLite ownership state, common-tree links, installed dependency/provides/conflict
+validation, removal protection for reverse dependencies, diagnostics, platform
 profiles, a legacy converter, and opt-in Entware detection.
 
-Dependency solving, service supervision, hooks, triggers, registry v2,
+Registry-backed dependency acquisition, service supervision, hooks, triggers,
 configuration merging, rollback and system overrides are intentionally not yet
-implemented. Manifests declaring unresolved package relations are rejected
-rather than being partially installed.
+implemented. A required dependency must already be installed; unresolved
+requirements are rejected rather than being partially installed.
 
 ## Legacy conversion
 
