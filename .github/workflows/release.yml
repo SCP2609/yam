@@ -2,78 +2,15 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  windows:
-    name: Build Windows binaries
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --bin yam
-      - uses: actions/upload-artifact@v4
-        with:
-          name: yam-x86_64-pc-windows-msvc
-          path: |
-            target/release/yam.exe
-
-  linux-cli:
-    name: Build Linux CLI
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build x86_64 musl CLI
-        run: >-
-          docker run --rm
-          -v "$GITHUB_WORKSPACE":/home/rust/src
-          -w /home/rust/src
-          messense/rust-musl-cross:x86_64-musl
-          cargo build --release --locked --bin yam
-      - uses: actions/upload-artifact@v4
-        with:
-          name: yam-x86_64-unknown-linux-musl
-          path: target/x86_64-unknown-linux-musl/release/yam
-
-  macos-arm64:
-    name: Build macOS arm64 CLI
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo build --release --locked --bin yam
-      - uses: actions/upload-artifact@v4
-        with:
-          name: yam-aarch64-apple-darwin
-          path: target/release/yam
-
-  lua-runtime:
-    name: Build Lua runtime host
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build AArch64 musl runtime
-        run: >-
-          docker run --rm
-          -v "$GITHUB_WORKSPACE":/home/rust/src
-          -w /home/rust/src/packages/yam-lua-runtime
-          messense/rust-musl-cross:aarch64-musl
-          cargo build --release --locked --bin yam-lua-runtime
-      - uses: actions/upload-artifact@v4
-        with:
-          name: yam-lua-runtime-aarch64-linux-musl
-          path: packages/yam-lua-runtime/target/aarch64-unknown-linux-musl/release/yam-lua-runtime
-
   release:
-    name: Build and publish release
-    needs: [windows, linux-cli, macos-arm64, lua-runtime]
+    name: Build speaker CLI and publish release
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -84,25 +21,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
       - name: Determine release version
         id: version
         shell: bash
         run: |
           version=$(cargo metadata --no-deps --format-version=1 | jq -r '.packages[] | select(.name == "yam") | .version')
-          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            tag="${GITHUB_REF_NAME}"
-          else
-            tag="v${version}"
-          fi
-          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]] || {
-            echo "Release tag must be SemVer, got: $tag" >&2
-            exit 1
-          }
-          [[ "$tag" == "v${version}" ]] || {
-            echo "Tag $tag does not match Cargo.toml version $version" >&2
-            exit 1
-          }
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then tag="${GITHUB_REF_NAME}"; else tag="v${version}"; fi
+          [[ "$tag" == "v${version}" ]] || { echo "Tag $tag does not match Cargo.toml version $version" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Validate source
@@ -110,40 +35,19 @@ jobs:
           cargo fmt --check
           cargo test --locked
           sh -n install.sh
-      - name: Package assets and checksums
+      - name: Build AArch64 musl speaker CLI
+        run: >-
+          docker run --rm
+          -v "$GITHUB_WORKSPACE":/home/rust/src
+          -w /home/rust/src
+          messense/rust-musl-cross:aarch64-musl
+          cargo build --release --locked --bin yam
+      - name: Create release
         run: |
-          mkdir -p dist
-      - uses: actions/download-artifact@v4
-        with:
-          name: yam-lua-runtime-aarch64-linux-musl
-          path: dist/runtime
-      - uses: actions/download-artifact@v4
-        with:
-          name: yam-x86_64-pc-windows-msvc
-          path: dist/windows
-      - uses: actions/download-artifact@v4
-        with:
-          name: yam-x86_64-unknown-linux-musl
-          path: dist/linux
-      - uses: actions/download-artifact@v4
-        with:
-          name: yam-aarch64-apple-darwin
-          path: dist/macos
-      - name: Create checksums
-        run: |
-          mv dist/runtime/yam-lua-runtime dist/yam-lua-runtime-aarch64-linux-musl
-          chmod 0755 dist/yam-lua-runtime-aarch64-linux-musl
-          mv dist/windows/yam.exe dist/yam-x86_64-pc-windows-msvc.exe
-          mv dist/linux/yam dist/yam-x86_64-unknown-linux-musl
-          mv dist/macos/yam dist/yam-aarch64-apple-darwin
-          (cd dist && sha256sum yam-lua-runtime-aarch64-linux-musl yam-x86_64-unknown-linux-musl yam-aarch64-apple-darwin yam-x86_64-pc-windows-msvc.exe > SHA256SUMS)
-      - name: Create GitHub release
-        run: |
+          mkdir dist
+          cp target/aarch64-unknown-linux-musl/release/yam dist/yam-aarch64-unknown-linux-musl
+          chmod 0755 dist/yam-aarch64-unknown-linux-musl
+          (cd dist && sha256sum yam-aarch64-unknown-linux-musl > SHA256SUMS)
           gh release create "${{ steps.version.outputs.tag }}" \
-            dist/yam-lua-runtime-aarch64-linux-musl \
-            dist/yam-x86_64-unknown-linux-musl \
-            dist/yam-aarch64-apple-darwin \
-            dist/yam-x86_64-pc-windows-msvc.exe \
-            dist/SHA256SUMS \
-            --title "YAM ${{ steps.version.outputs.version }}" \
-            --generate-notes
+            dist/yam-aarch64-unknown-linux-musl dist/SHA256SUMS \
+            --title "YAM ${{ steps.version.outputs.version }}" --generate-notes
