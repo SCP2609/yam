@@ -160,6 +160,14 @@ pub struct InstalledPackage {
     pub target: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct InstalledService {
+    pub package: String,
+    pub name: String,
+    pub enabled: bool,
+    pub spec: ServiceSpec,
+}
+
 pub struct Manager {
     root: PathBuf,
     profile: PlatformProfile,
@@ -198,11 +206,18 @@ impl Manager {
                package_name TEXT NOT NULL REFERENCES packages(name) ON DELETE CASCADE,
                PRIMARY KEY(capability, package_name)
              );
-             CREATE TABLE IF NOT EXISTS dependencies (
-               package_name TEXT NOT NULL REFERENCES packages(name) ON DELETE CASCADE,
-               requirement TEXT NOT NULL,
-               PRIMARY KEY(package_name, requirement)
-             );",
+              CREATE TABLE IF NOT EXISTS dependencies (
+                package_name TEXT NOT NULL REFERENCES packages(name) ON DELETE CASCADE,
+                requirement TEXT NOT NULL,
+                PRIMARY KEY(package_name, requirement)
+              );
+              CREATE TABLE IF NOT EXISTS services (
+                package_name TEXT NOT NULL REFERENCES packages(name) ON DELETE CASCADE,
+                name TEXT NOT NULL,
+                spec_yaml TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(package_name, name)
+              );",
         )?;
         Ok(Self { root, profile, db })
     }
@@ -430,6 +445,10 @@ impl Manager {
             "DELETE FROM dependencies WHERE package_name=?1",
             [&manifest.name],
         )?;
+        transaction.execute(
+            "DELETE FROM services WHERE package_name=?1",
+            [&manifest.name],
+        )?;
         for capability in &manifest.provides {
             validate_capability(capability)?;
             transaction.execute(
@@ -441,6 +460,12 @@ impl Manager {
             transaction.execute(
                 "INSERT INTO dependencies(package_name,requirement) VALUES(?1,?2)",
                 params![manifest.name, requirement],
+            )?;
+        }
+        for (name, spec) in &manifest.services {
+            transaction.execute(
+                "INSERT INTO services(package_name,name,spec_yaml) VALUES(?1,?2,?3)",
+                params![manifest.name, name, serde_yaml::to_string(spec)?],
             )?;
         }
         transaction.execute("DELETE FROM links WHERE package_name=?1", [&manifest.name])?;
@@ -500,6 +525,31 @@ impl Manager {
             .query_map([name], |row| row.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         Ok(files)
+    }
+
+    pub fn services(&self) -> Result<Vec<InstalledService>> {
+        let mut statement = self.db.prepare(
+            "SELECT package_name,name,enabled,spec_yaml FROM services ORDER BY package_name,name",
+        )?;
+        let services: Vec<InstalledService> = statement
+            .query_map([], |row| {
+                let raw: String = row.get(3)?;
+                let spec = serde_yaml::from_str(&raw).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        raw.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                Ok(InstalledService {
+                    package: row.get(0)?,
+                    name: row.get(1)?,
+                    enabled: row.get::<_, i64>(2)? != 0,
+                    spec,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(services)
     }
 
     pub fn which(&self, path: &str) -> Result<Option<String>> {

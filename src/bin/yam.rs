@@ -56,6 +56,10 @@ enum Command {
         #[command(subcommand)]
         command: EntwareCommand,
     },
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     Registry {
         #[command(subcommand)]
         command: RegistryCommand,
@@ -74,6 +78,10 @@ enum Command {
 #[derive(Subcommand)]
 enum EntwareCommand {
     Status,
+    List,
+}
+#[derive(Subcommand)]
+enum ServiceCommand {
     List,
 }
 #[derive(Subcommand)]
@@ -133,7 +141,7 @@ fn main() -> Result<()> {
                 Command::Doctor => {
                     let problems = manager.doctor()?;
                     if problems.is_empty() {
-                        println!("YAM v2 state is healthy.");
+                        println!("Состояние пакетов в порядке.");
                     } else {
                         for problem in problems {
                             eprintln!("problem: {problem}");
@@ -161,6 +169,23 @@ fn main() -> Result<()> {
                         }
                     ),
                     EntwareCommand::List => print!("{}", manager.entware_list()?),
+                },
+                Command::Service { command } => match command {
+                    ServiceCommand::List => {
+                        for service in manager.services()? {
+                            println!(
+                                "{}/{}\t{}\t{}",
+                                service.package,
+                                service.name,
+                                if service.enabled {
+                                    "enabled"
+                                } else {
+                                    "disabled"
+                                },
+                                service.spec.exec.join(" ")
+                            );
+                        }
+                    }
                 },
                 Command::Registry { command } => match command {
                     RegistryCommand::List => {

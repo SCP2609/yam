@@ -68,3 +68,5 @@ services:
 
 Поддерживаются `never`, `on-failure` и `always`. Не добавляйте в пакет init-
 скрипты systemd, OpenRC или BusyBox.
+
+Посмотреть сохранённые декларации можно командой `yam service list`.
