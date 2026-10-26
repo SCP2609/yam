@@ -10,7 +10,7 @@ use yam::v2::registry;
 use yam::v2::{Manager, PlatformProfile};
 
 #[derive(Parser)]
-#[command(name = "yam", about = "YAM v2 package manager")]
+#[command(name = "yam", about = "Y Application Manager")]
 struct Cli {
     /// Platform profile ID, such as yandexmicro.
     #[arg(long, env = "YAM_PLATFORM")]
