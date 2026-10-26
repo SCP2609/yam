@@ -259,6 +259,7 @@ struct PluginInfo {
     /// Absolute package directory on the speaker, used by `yam tui`.
     directory: PathBuf,
     enabled: bool,
+    service_enabled: bool,
     running: bool,
     compatible: bool,
     incompatibility: Option<String>,
@@ -437,6 +438,7 @@ fn parse_pattern(s: &str) -> Result<(bool, Vec<Frame>)> {
 struct PluginManager {
     root: PathBuf,
     enabled: HashSet<String>,
+    service_enabled: HashSet<String>,
     running: HashMap<String, Arc<AtomicBool>>,
 }
 impl PluginManager {
@@ -449,9 +451,35 @@ impl PluginManager {
             }),
             Err(_) => HashSet::new(),
         };
+        let service_path = root.join("services.json");
+        let service_enabled = match fs::read_to_string(&service_path) {
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|error| {
+                tracing::warn!(%error, "services.json is corrupt; no packages auto-start");
+                HashSet::new()
+            }),
+            Err(_) => {
+                // Migrate old mode-based services exactly once when no explicit
+                // service state exists yet.
+                let legacy = fs::read_dir(&root)?
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| {
+                        let manifest = fs::read_to_string(entry.path().join("plugin.toml")).ok()?;
+                        let manifest = toml::from_str::<Manifest>(&manifest).ok()?;
+                        (enabled.contains(&manifest.id)
+                            && manifest.launch.mode == LaunchMode::Service)
+                            .then_some(manifest.id)
+                    })
+                    .collect::<HashSet<_>>();
+                if !legacy.is_empty() {
+                    write_atomic(&service_path, &serde_json::to_vec_pretty(&legacy)?)?;
+                }
+                legacy
+            }
+        };
         Ok(Self {
             root,
             enabled,
+            service_enabled,
             running: HashMap::new(),
         })
     }
@@ -459,6 +487,10 @@ impl PluginManager {
         write_atomic(
             &self.root.join("enabled.json"),
             &serde_json::to_vec_pretty(&self.enabled)?,
+        )?;
+        write_atomic(
+            &self.root.join("services.json"),
+            &serde_json::to_vec_pretty(&self.service_enabled)?,
         )
     }
     fn list(&self, device: &DeviceProfile) -> Result<Vec<PluginInfo>> {
@@ -475,6 +507,7 @@ impl PluginManager {
                     out.push(PluginInfo {
                         directory: e.path(),
                         enabled: self.enabled.contains(&manifest.id),
+                        service_enabled: self.service_enabled.contains(&manifest.id),
                         running: self.running.contains_key(&manifest.id),
                         compatible: reason.is_none(),
                         incompatibility: reason,
@@ -563,6 +596,7 @@ impl PluginManager {
         }
         fs::remove_dir_all(p)?;
         self.enabled.remove(id);
+        self.service_enabled.remove(id);
         self.save()
     }
 }
@@ -2689,24 +2723,13 @@ async fn run_package(
     }
 }
 
-async fn start_package(
-    app: App,
-    id: String,
-    invocation_args: Vec<String>,
-    expected_mode: Option<LaunchMode>,
-) -> Result<()> {
+async fn start_package(app: App, id: String, invocation_args: Vec<String>) -> Result<()> {
     let cancelled = {
         let mut plugins = app.plugins.lock().await;
         if !plugins.enabled.contains(&id) {
             bail!("package is disabled")
         }
         let manifest = plugins.manifest(&id)?;
-        if expected_mode
-            .as_ref()
-            .is_some_and(|mode| manifest.launch.mode != *mode)
-        {
-            bail!("package launch mode does not support this command")
-        }
         if manifest.launch.kind == LaunchKind::Binary
             && !app.settings.lock().await.allow_plugin_binaries
         {
@@ -2715,9 +2738,6 @@ async fn start_package(
         if !invocation_args.is_empty() {
             if manifest.launch.kind != LaunchKind::Binary {
                 bail!("only binary packages accept invocation arguments")
-            }
-            if manifest.launch.mode != LaunchMode::Oneshot {
-                bail!("invocation arguments are only supported for oneshot packages")
             }
         }
         if let Some(previous) = plugins.running.remove(&id) {
@@ -2783,8 +2803,14 @@ async fn install_registry(
     State(a): State<App>,
     Json(request): Json<RegistryInstall>,
 ) -> Result<Json<Manifest>, ApiError> {
+    let device = a.device.lock().await.clone();
     let package = task::spawn_blocking(move || {
-        download_registry_package(&request.registry, &request.id, request.version.as_deref())
+        download_registry_package(
+            &request.registry,
+            &request.id,
+            request.version.as_deref(),
+            &device,
+        )
     })
     .await
     .context("registry download task failed")??;
@@ -2792,7 +2818,12 @@ async fn install_registry(
     Ok(Json(manifest))
 }
 
-fn download_registry_package(registry: &str, id: &str, version: Option<&str>) -> Result<Vec<u8>> {
+fn download_registry_package(
+    registry: &str,
+    id: &str,
+    version: Option<&str>,
+    device: &DeviceProfile,
+) -> Result<Vec<u8>> {
     let index_url = if registry.trim_end_matches('/').ends_with("index.json") {
         registry.to_string()
     } else {
@@ -2806,21 +2837,26 @@ fn download_registry_package(registry: &str, id: &str, version: Option<&str>) ->
     let packages = index["packages"]
         .as_array()
         .context("invalid registry package index")?;
-    let entry = match version {
-        Some(version) => packages
-            .iter()
-            .find(|entry| entry["id"] == id && entry["version"] == version),
-        None => packages
-            .iter()
-            .filter(|entry| entry["id"] == id)
-            .max_by(|left, right| {
-                registry_version(
-                    left["version"].as_str().unwrap_or(""),
-                    right["version"].as_str().unwrap_or(""),
-                )
-            }),
-    }
-    .context("package version not found in registry")?;
+    let entry = packages
+        .iter()
+        .filter(|entry| entry["id"] == id)
+        .filter(|entry| version.is_none_or(|version| entry["version"] == version))
+        .filter(|entry| registry_compatible(entry, device))
+        .max_by(|left, right| {
+            registry_version(
+                left["version"].as_str().unwrap_or(""),
+                right["version"].as_str().unwrap_or(""),
+            )
+            .then_with(|| {
+                registry_target_rank(left, device).cmp(&registry_target_rank(right, device))
+            })
+        })
+        .with_context(|| {
+            format!(
+                "no package build for {} matches device {}",
+                id, device.model
+            )
+        })?;
     let package_url = entry["url"]
         .as_str()
         .context("registry entry has no package URL")?;
@@ -2840,6 +2876,25 @@ fn download_registry_package(registry: &str, id: &str, version: Option<&str>) ->
         bail!("package checksum mismatch")
     }
     Ok(package)
+}
+fn registry_values<'a>(entry: &'a serde_json::Value, key: &str) -> Vec<&'a str> {
+    entry[key]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
+}
+fn registry_compatible(entry: &serde_json::Value, device: &DeviceProfile) -> bool {
+    let models = registry_values(entry, "models");
+    let features = registry_values(entry, "features");
+    (models.is_empty() || models.contains(&device.model.as_str()))
+        && features
+            .iter()
+            .all(|feature| device.features.iter().any(|available| available == feature))
+}
+fn registry_target_rank(entry: &serde_json::Value, device: &DeviceProfile) -> u8 {
+    u8::from(registry_values(entry, "models").contains(&device.model.as_str()))
 }
 
 fn registry_version(left: &str, right: &str) -> std::cmp::Ordering {
@@ -2870,19 +2925,16 @@ async fn toggle(
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
     let mut p = a.plugins.lock().await;
-    let manifest = p.manifest(&id)?;
     let enabled = p.enabled.insert(id.clone());
     if !enabled {
         p.enabled.remove(&id);
+        p.service_enabled.remove(&id);
         if let Some(token) = p.running.remove(&id) {
             token.store(true, Ordering::Relaxed);
         }
     }
     p.save()?;
     drop(p);
-    if enabled && manifest.launch.mode == LaunchMode::Service {
-        start_package(a, id, Vec::new(), Some(LaunchMode::Service)).await?;
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 async fn remove(
@@ -2901,7 +2953,6 @@ async fn invoke(
         a,
         id,
         invocation.map(|value| value.0.args).unwrap_or_default(),
-        Some(LaunchMode::Oneshot),
     )
     .await?;
     Ok(StatusCode::ACCEPTED)
@@ -2910,8 +2961,35 @@ async fn start_service(
     State(a): State<App>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    start_package(a, id, Vec::new(), Some(LaunchMode::Service)).await?;
+    start_package(a, id, Vec::new()).await?;
     Ok(StatusCode::ACCEPTED)
+}
+async fn enable_service(
+    State(a): State<App>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    {
+        let mut plugins = a.plugins.lock().await;
+        plugins.manifest(&id)?;
+        plugins.enabled.insert(id.clone());
+        plugins.service_enabled.insert(id.clone());
+        plugins.save()?;
+    }
+    start_package(a, id, Vec::new()).await?;
+    Ok(StatusCode::ACCEPTED)
+}
+async fn disable_service(
+    State(a): State<App>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, ApiError> {
+    let mut plugins = a.plugins.lock().await;
+    plugins.manifest(&id)?;
+    plugins.service_enabled.remove(&id);
+    if let Some(token) = plugins.running.remove(&id) {
+        token.store(true, Ordering::Relaxed);
+    }
+    plugins.save()?;
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn stop_plugin(
     State(a): State<App>,
@@ -3269,21 +3347,12 @@ async fn main() -> Result<()> {
             .await
             .list(&device)?
             .into_iter()
-            .filter(|package| {
-                package.enabled && package.manifest.launch.mode == LaunchMode::Service
-            })
+            .filter(|package| package.enabled && package.service_enabled)
             .map(|package| package.manifest.id)
             .collect::<Vec<_>>()
     };
     for id in services {
-        if let Err(error) = start_package(
-            app.clone(),
-            id.clone(),
-            Vec::new(),
-            Some(LaunchMode::Service),
-        )
-        .await
-        {
+        if let Err(error) = start_package(app.clone(), id.clone(), Vec::new()).await {
             tracing::error!(package = %id, %error, "service package failed to start");
         }
     }
@@ -3306,6 +3375,8 @@ async fn main() -> Result<()> {
             .route("/api/plugins/:id", delete(remove))
             .route("/api/plugins/:id/toggle", post(toggle))
             .route("/api/plugins/:id/invoke", post(invoke))
+            .route("/api/plugins/:id/service/enable", post(enable_service))
+            .route("/api/plugins/:id/service/disable", post(disable_service))
             .route("/api/plugins/:id/service/start", post(start_service))
             .route("/api/plugins/:id/stop", post(stop_plugin))
             .route("/api/plugins/:id/logs", get(package_logs))
