@@ -25,12 +25,12 @@ pub struct Registry {
     pub url: String,
     pub key: String,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Catalogue {
     pub format: u32,
     pub packages: Vec<CatalogueEntry>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct CatalogueEntry {
     pub name: String,
     pub summary: String,
@@ -40,14 +40,20 @@ pub struct CatalogueEntry {
     #[serde(default)]
     pub keywords: Vec<String>,
     pub homepage: Option<String>,
+    /// Virtual names this package's latest version provides. Lets the
+    /// short-name resolver find a candidate from the catalogue alone,
+    /// without fetching every package's full index (B2). Absent in an
+    /// older index, read as "provides nothing".
+    #[serde(default)]
+    pub provides: Vec<String>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageIndex {
     pub format: u32,
     pub name: String,
     pub versions: BTreeMap<String, VersionMetadata>,
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionMetadata {
     pub artifacts: BTreeMap<String, Artifact>,
     pub published_at: Option<String>,
@@ -59,6 +65,12 @@ pub struct VersionMetadata {
     pub provides: Vec<String>,
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Packages this version replaces, mirroring
+    /// `PackageManifest::replaces`. Not consumed by the resolver in this
+    /// PR; present so a future resolver-side replaces check (A4-adjacent)
+    /// doesn't need another index format bump.
+    #[serde(default)]
+    pub replaces: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Artifact {
@@ -236,6 +248,204 @@ pub fn download_artifact(
     }
     Ok(())
 }
+
+/// Source of registry data, abstracted so the resolution algorithm
+/// (`resolve_with`) can be exercised against fixed catalogues/indexes in
+/// tests instead of a live HTTPS registry (B2).
+pub trait IndexSource {
+    fn catalogue(&mut self) -> Result<&Catalogue>;
+    fn package_index(&mut self, name: &str) -> Result<&PackageIndex>;
+}
+
+pub struct LiveSource<'a> {
+    registry: &'a Registry,
+    catalogue: Option<Catalogue>,
+    indices: BTreeMap<String, PackageIndex>,
+}
+impl<'a> LiveSource<'a> {
+    pub fn new(registry: &'a Registry) -> Self {
+        Self {
+            registry,
+            catalogue: None,
+            indices: BTreeMap::new(),
+        }
+    }
+}
+impl IndexSource for LiveSource<'_> {
+    fn catalogue(&mut self) -> Result<&Catalogue> {
+        if self.catalogue.is_none() {
+            self.catalogue = Some(catalogue(self.registry)?);
+        }
+        Ok(self.catalogue.as_ref().expect("just populated"))
+    }
+    fn package_index(&mut self, name: &str) -> Result<&PackageIndex> {
+        if !self.indices.contains_key(name) {
+            let index = package_index(self.registry, name)?;
+            self.indices.insert(name.to_owned(), index);
+        }
+        Ok(self.indices.get(name).expect("just populated"))
+    }
+}
+
+/// Fixed-index source for tests: never touches the network.
+#[cfg(test)]
+pub struct FakeSource {
+    pub catalogue: Catalogue,
+    pub indices: BTreeMap<String, PackageIndex>,
+}
+#[cfg(test)]
+impl IndexSource for FakeSource {
+    fn catalogue(&mut self) -> Result<&Catalogue> {
+        Ok(&self.catalogue)
+    }
+    fn package_index(&mut self, name: &str) -> Result<&PackageIndex> {
+        self.indices
+            .get(name)
+            .with_context(|| format!("no index published for {name}"))
+    }
+}
+
+/// What the local database already has installed, so the resolver can
+/// skip a dependency (or a root request) that's already satisfied
+/// instead of planning to redownload or reinstall it (B2).
+#[derive(Debug, Clone, Default)]
+pub struct InstalledSnapshot {
+    pub packages: BTreeMap<String, semver::Version>,
+    /// Virtual name -> installed packages that provide it.
+    pub provides: BTreeMap<String, BTreeSet<String>>,
+}
+impl InstalledSnapshot {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+    fn satisfies(&self, name: &str, constraints: &version::Constraints) -> bool {
+        if let Some(version) = self.packages.get(name) {
+            if constraints.matches(version) {
+                return true;
+            }
+        }
+        if let Some(providers) = self.provides.get(name) {
+            for provider in providers {
+                if let Some(version) = self.packages.get(provider) {
+                    if constraints.matches(version) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+/// `resolve`'s replacement, built on `IndexSource` so it can be unit
+/// tested against fixed data (B2). A full `ns/name` request resolves to
+/// exactly that package; a short name's resolution against `installed`
+/// and the catalogue's `yam/` providers is not implemented yet in this
+/// commit -- see the `TODO(B2)` in `resolve_one_with`.
+pub fn resolve_with<S: IndexSource>(
+    source: &mut S,
+    requested: &str,
+    requested_version: Option<&str>,
+    profile: &PlatformProfile,
+    installed: &InstalledSnapshot,
+) -> Result<Vec<ResolvedPackage>> {
+    let mut resolved = Vec::new();
+    let mut completed = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    resolve_one_with(
+        source,
+        requested,
+        requested_version,
+        profile,
+        installed,
+        &mut resolved,
+        &mut completed,
+        &mut visiting,
+    )?;
+    Ok(resolved)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_one_with<S: IndexSource>(
+    source: &mut S,
+    name: &str,
+    requested_version: Option<&str>,
+    profile: &PlatformProfile,
+    installed: &InstalledSnapshot,
+    resolved: &mut Vec<ResolvedPackage>,
+    completed: &mut BTreeSet<String>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<()> {
+    if completed.contains(name) {
+        return Ok(());
+    }
+    if !name.contains('/') {
+        // TODO(B2): resolve a short/virtual name against `installed`
+        // and the catalogue's yam/ providers instead of always
+        // refusing. Kept identical to the old resolve_one for now so
+        // introducing IndexSource is a pure refactor on its own.
+        bail!("virtual dependency {name:?} requires a registry provider policy")
+    }
+    if !visiting.insert(name.into()) {
+        bail!("dependency cycle detected at {name}")
+    }
+    let index = source.package_index(name)?.clone();
+    let version = match requested_version {
+        Some(version) => version.to_owned(),
+        None => index
+            .versions
+            .keys()
+            .filter_map(|key| version::parse_version(key).ok().map(|parsed| (parsed, key)))
+            .filter(|(parsed, _)| parsed.pre.is_empty())
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .map(|(_, key)| key.clone())
+            .context("registry has no stable versions")?,
+    };
+    let metadata = index
+        .versions
+        .get(&version)
+        .context("package version not found")?
+        .clone();
+    let artifact = metadata
+        .artifacts
+        .get(&profile.id)
+        .or_else(|| metadata.artifacts.get("any"))
+        .context("package version has no artifact for this platform")?
+        .clone();
+    if artifact.arch != profile.arch {
+        bail!(
+            "artifact architecture {} does not match {}",
+            artifact.arch,
+            profile.arch
+        )
+    }
+    for requirement in &metadata.depends {
+        let (dependency, constraint_words) = split_requirement(requirement)?;
+        // TODO(B2): skip a dependency installed already satisfies,
+        // same as the root (see the short-name TODO above).
+        let dependency_index = source.package_index(dependency)?;
+        let selected = select_version(dependency_index, &constraint_words)?;
+        resolve_one_with(
+            source,
+            dependency,
+            Some(&selected),
+            profile,
+            installed,
+            resolved,
+            completed,
+            visiting,
+        )?;
+    }
+    visiting.remove(name);
+    completed.insert(name.to_owned());
+    resolved.push(ResolvedPackage {
+        name: name.into(),
+        version,
+        artifact,
+    });
+    Ok(())
+}
+
 pub fn resolve(
     registry: &Registry,
     requested: &str,
@@ -395,6 +605,7 @@ mod tests {
                             recommends: Vec::new(),
                             provides: Vec::new(),
                             conflicts: Vec::new(),
+                            replaces: Vec::new(),
                         },
                     )
                 })
@@ -443,5 +654,199 @@ mod tests {
     fn default_selection_never_picks_a_prerelease() {
         let index = index_with(&["1.0.0", "1.1.0-rc.1"]);
         assert_eq!(select_version(&index, &[]).unwrap(), "1.0.0");
+    }
+
+    fn profile() -> PlatformProfile {
+        serde_yaml::from_str(
+            "id: yandexmicro\narch: aarch64\ntriple: aarch64-unknown-linux-musl\npaths:\n  root: /tmp/root\n  etc: /tmp/etc\n  var: /tmp/var\n  run: /tmp/run\n",
+        )
+        .unwrap()
+    }
+
+    fn artifact() -> Artifact {
+        Artifact {
+            arch: "aarch64".into(),
+            url: "https://example/a.yampkg".into(),
+            sha256: "0".repeat(64),
+            size: 1,
+        }
+    }
+
+    /// An index with one or more versions, each with its own `depends`
+    /// and `provides`, for B2's cross-package resolution tests.
+    fn index(name: &str, versions: &[(&str, Vec<&str>, Vec<&str>)]) -> PackageIndex {
+        PackageIndex {
+            format: 2,
+            name: name.into(),
+            versions: versions
+                .iter()
+                .map(|(version, depends, provides)| {
+                    (
+                        version.to_string(),
+                        VersionMetadata {
+                            artifacts: BTreeMap::from([("any".to_string(), artifact())]),
+                            published_at: None,
+                            depends: depends.iter().map(|d| d.to_string()).collect(),
+                            recommends: Vec::new(),
+                            provides: provides.iter().map(|p| p.to_string()).collect(),
+                            conflicts: Vec::new(),
+                            replaces: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn entry(name: &str, provides: &[&str]) -> CatalogueEntry {
+        CatalogueEntry {
+            name: name.into(),
+            summary: String::new(),
+            latest: "1.0.0".into(),
+            targets: Vec::new(),
+            keywords: Vec::new(),
+            homepage: None,
+            provides: provides.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn short_name_resolves_to_the_official_yam_package() {
+        let mut source = FakeSource {
+            catalogue: Catalogue {
+                format: 1,
+                packages: vec![entry("yam/spotify", &[])],
+            },
+            indices: BTreeMap::from([(
+                "yam/spotify".to_string(),
+                index("yam/spotify", &[("1.0.0", vec![], vec![])]),
+            )]),
+        };
+        let result = resolve_with(
+            &mut source,
+            "spotify",
+            None,
+            &profile(),
+            &InstalledSnapshot::empty(),
+        );
+        assert!(
+            result.is_ok(),
+            "a short name with a single yam/ provider must resolve, got {result:?}"
+        );
+        let resolved = result.unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "yam/spotify");
+    }
+
+    #[test]
+    fn short_name_already_satisfied_by_an_installed_provider_resolves_to_nothing() {
+        let mut source = FakeSource {
+            catalogue: Catalogue {
+                format: 1,
+                packages: vec![entry("yam/soloist", &["spotify-connect"])],
+            },
+            indices: BTreeMap::from([(
+                "yam/soloist".to_string(),
+                index("yam/soloist", &[("1.0.0", vec![], vec!["spotify-connect"])]),
+            )]),
+        };
+        let mut installed = InstalledSnapshot::empty();
+        installed.packages.insert(
+            "vasya/librespot".into(),
+            semver::Version::parse("1.0.0").unwrap(),
+        );
+        installed.provides.insert(
+            "spotify-connect".into(),
+            BTreeSet::from(["vasya/librespot".to_string()]),
+        );
+        let result = resolve_with(&mut source, "spotify-connect", None, &profile(), &installed);
+        assert!(
+            result.is_ok(),
+            "a short name already satisfied by something installed must resolve to nothing, got {result:?}"
+        );
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn short_name_with_two_yam_providers_is_an_error() {
+        let mut source = FakeSource {
+            catalogue: Catalogue {
+                format: 1,
+                packages: vec![
+                    entry("yam/soloist", &["spotify-connect"]),
+                    entry("yam/alt-player", &["spotify-connect"]),
+                ],
+            },
+            indices: BTreeMap::new(),
+        };
+        let result = resolve_with(
+            &mut source,
+            "spotify-connect",
+            None,
+            &profile(),
+            &InstalledSnapshot::empty(),
+        );
+        assert!(
+            result.is_err(),
+            "two yam/ providers of the same virtual name must be an error, got {result:?}"
+        );
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("yam/soloist") && message.contains("yam/alt-player"),
+            "error should list both providers, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn short_name_provider_outside_yam_is_rejected_with_a_hint() {
+        let mut source = FakeSource {
+            catalogue: Catalogue {
+                format: 1,
+                packages: vec![entry("vasya/librespot", &["spotify-connect"])],
+            },
+            indices: BTreeMap::new(),
+        };
+        let result = resolve_with(
+            &mut source,
+            "spotify-connect",
+            None,
+            &profile(),
+            &InstalledSnapshot::empty(),
+        );
+        assert!(result.is_err());
+        let message = result.unwrap_err().to_string();
+        assert!(
+            message.contains("vasya/librespot"),
+            "error should name the non-yam/ provider as a hint to install it explicitly, got {message:?}"
+        );
+    }
+
+    #[test]
+    fn full_name_dependency_cycle_is_still_detected() {
+        let mut source = FakeSource {
+            catalogue: Catalogue {
+                format: 1,
+                packages: vec![],
+            },
+            indices: BTreeMap::from([
+                (
+                    "yam/a".to_string(),
+                    index("yam/a", &[("1.0.0", vec!["yam/b"], vec![])]),
+                ),
+                (
+                    "yam/b".to_string(),
+                    index("yam/b", &[("1.0.0", vec!["yam/a"], vec![])]),
+                ),
+            ]),
+        };
+        let result = resolve_with(
+            &mut source,
+            "yam/a",
+            None,
+            &profile(),
+            &InstalledSnapshot::empty(),
+        );
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("cycle"));
     }
 }
