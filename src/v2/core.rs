@@ -787,21 +787,48 @@ impl Manager {
             links
         };
         let transaction = self.db.transaction()?;
+        transaction.execute("DELETE FROM packages WHERE name=?1", [name])?;
+
+        // Disk phase: record each removed link so a failure partway
+        // through can be undone, leaving every link exactly as it was
+        // (B1), with the uncommitted transaction already guaranteeing
+        // the database side reverts to "still installed".
+        let mut undo: Vec<Undo> = Vec::new();
         let mut links_removed: u32 = 0;
-        for (path, target) in &links {
-            let link = self.root.join(path);
-            if link.is_symlink() && fs::read_link(&link).ok().as_deref() == Some(Path::new(target))
-            {
-                fs::remove_file(&link)
-                    .with_context(|| format!("remove link {}", link.display()))?;
-                links_removed += 1;
-                #[cfg(test)]
-                if self.fail_after_link_removals == Some(links_removed) {
-                    bail!("injected test failure after removing {links_removed} links")
+        let disk_result: Result<()> = (|| {
+            for (path, target) in &links {
+                let link = self.root.join(path);
+                if link.is_symlink()
+                    && fs::read_link(&link).ok().as_deref() == Some(Path::new(target))
+                {
+                    fs::remove_file(&link)
+                        .with_context(|| format!("remove link {}", link.display()))?;
+                    undo.push(Undo::RestoreSymlink {
+                        path: link,
+                        target: PathBuf::from(target),
+                    });
+                    links_removed += 1;
+                    #[cfg(test)]
+                    if self.fail_after_link_removals == Some(links_removed) {
+                        bail!("injected test failure after removing {links_removed} links")
+                    }
                 }
             }
+            Ok(())
+        })();
+        if let Err(error) = disk_result {
+            let rollback_errors = unwind(undo);
+            // `transaction` is dropped here without being committed,
+            // which rolls the packages-row deletion back.
+            return Err(if rollback_errors.is_empty() {
+                error
+            } else {
+                error.context(format!(
+                    "disk rollback left problems behind, run `yam repair`: {}",
+                    rollback_errors.join("; ")
+                ))
+            });
         }
-        transaction.execute("DELETE FROM packages WHERE name=?1", [name])?;
         transaction.commit()?;
         // A1: prune common-tree directories left empty by the links just
         // removed, then delete every version directory (not just the
