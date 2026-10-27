@@ -2388,4 +2388,45 @@ mod tests {
             "repair must clear stale .staging/ directories left by an interrupted transaction"
         );
     }
+
+    #[test]
+    fn install_refuses_to_run_while_another_transaction_holds_the_lock() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+        let run_dir = profile.paths.run.clone();
+
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/plug-tool", b"payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        let before = snapshot_root(&manager, &root);
+
+        // Simulate another yam process already holding the transaction
+        // lock.
+        fs::create_dir_all(&run_dir).unwrap();
+        let held = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(run_dir.join("yam.lock"))
+            .unwrap();
+        fs4::fs_std::FileExt::lock_exclusive(&held).unwrap();
+
+        let result = manager.install(&artifact, true);
+        assert!(
+            result.is_err(),
+            "install must refuse to run while another transaction holds the lock, got {result:?}"
+        );
+
+        drop(held);
+
+        let after = snapshot_root(&manager, &root);
+        assert_eq!(
+            before, after,
+            "a refused install due to a held lock must change nothing on disk or in the database"
+        );
+    }
 }

@@ -24,6 +24,7 @@ walkdir = "2"
 tar = "0.4"
 zstd = "0.13"
 semver = "1"
+fs4 = { version = "0.9", features = ["sync"] }
 
 [profile.release]
 # The manager is deployed to storage-constrained speakers.
