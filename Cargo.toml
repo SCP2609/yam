@@ -23,6 +23,7 @@ uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 tar = "0.4"
 zstd = "0.13"
+semver = "1"
 
 [profile.release]
 # The manager is deployed to storage-constrained speakers.

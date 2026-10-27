@@ -1774,6 +1774,7 @@ dependencies = [
  "ed25519-dalek",
  "reqwest",
  "rusqlite",
+ "semver",
  "serde",
  "serde_json",
  "serde_yaml",

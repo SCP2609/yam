@@ -12,6 +12,8 @@ use std::{
 use tar::{Archive, Builder, Header};
 use uuid::Uuid;
 
+use super::version;
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformProfile {
@@ -811,7 +813,11 @@ impl Manager {
         Ok(())
     }
 
-    fn requirement_satisfied(&self, name: &str, constraints: &[VersionConstraint]) -> Result<bool> {
+    fn requirement_satisfied(
+        &self,
+        name: &str,
+        constraints: &version::Constraints,
+    ) -> Result<bool> {
         let mut statement = self.db.prepare(
             "SELECT p.name,p.version FROM packages p WHERE p.name=?1
              UNION SELECT p.name,p.version FROM packages p JOIN provides v ON v.package_name=p.name WHERE v.capability=?1",
@@ -821,12 +827,9 @@ impl Manager {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (_, version) in candidates {
-            let version = Version::parse(&version)?;
-            if constraints
-                .iter()
-                .all(|constraint| constraint.matches(&version))
-            {
+        for (_, candidate_version) in candidates {
+            let candidate_version = version::parse_version(&candidate_version)?;
+            if constraints.matches(&candidate_version) {
                 return Ok(true);
             }
         }
@@ -834,112 +837,20 @@ impl Manager {
     }
 }
 
-#[derive(Debug)]
-enum VersionConstraint {
-    Equal(Version),
-    AtLeast(Version),
-    LessThan(Version),
-    Caret(Version),
-    Tilde(Version),
-}
-#[derive(Debug, Clone, Eq, Ord, PartialEq, PartialOrd)]
-struct Version {
-    major: u64,
-    minor: u64,
-    patch: u64,
-    pre: Option<String>,
-}
-impl Version {
-    fn parse(value: &str) -> Result<Self> {
-        validate_version(value)?;
-        let (main, _) = value
-            .split_once('+')
-            .map_or((value, None), |(main, build)| (main, Some(build)));
-        let (main, pre) = main
-            .split_once('-')
-            .map_or((main, None), |(main, pre)| (main, Some(pre)));
-        let values = main
-            .split('.')
-            .map(str::parse)
-            .collect::<std::result::Result<Vec<u64>, _>>()?;
-        Ok(Self {
-            major: values[0],
-            minor: values[1],
-            patch: values[2],
-            pre: pre.map(str::to_owned),
-        })
-    }
-}
-impl VersionConstraint {
-    fn matches(&self, version: &Version) -> bool {
-        match self {
-            Self::Equal(expected) => version == expected,
-            Self::AtLeast(expected) => version >= expected,
-            Self::LessThan(expected) => version < expected,
-            Self::Caret(expected) => {
-                version >= expected
-                    && (version.major == expected.major
-                        && (expected.major != 0 || version.minor == expected.minor))
-            }
-            Self::Tilde(expected) => {
-                version >= expected
-                    && version.major == expected.major
-                    && version.minor == expected.minor
-            }
-        }
-    }
-}
-fn parse_requirement(value: &str) -> Result<(&str, Vec<VersionConstraint>)> {
+/// Split a dependency/conflict/replaces entry into its package or virtual
+/// name and its version constraints. Shared with `registry.rs` so the two
+/// resolvers parse requirements identically (previously each had its own
+/// string-based version comparison that disagreed with the other).
+fn parse_requirement(value: &str) -> Result<(&str, version::Constraints)> {
     let mut words = value.split_whitespace();
     let name = words.next().context("empty package requirement")?;
     validate_capability(name)?;
-    let constraints = words.map(parse_constraint).collect::<Result<Vec<_>>>()?;
+    let rest = value[name.len()..].trim_start();
+    let constraints = version::Constraints::parse(rest)?;
     Ok((name, constraints))
 }
 fn requirement_name(value: &str) -> Result<&str> {
     Ok(parse_requirement(value)?.0)
-}
-fn parse_constraint(value: &str) -> Result<VersionConstraint> {
-    let (operator, version) = [">=", "^", "~", "=", "<"]
-        .iter()
-        .find_map(|operator| {
-            value
-                .strip_prefix(operator)
-                .map(|version| (*operator, version))
-        })
-        .context("invalid version constraint")?;
-    let version = Version::parse(&normalize_constraint_version(version)?)?;
-    Ok(match operator {
-        ">=" => VersionConstraint::AtLeast(version),
-        "<" => VersionConstraint::LessThan(version),
-        "^" => VersionConstraint::Caret(version),
-        "~" => VersionConstraint::Tilde(version),
-        "=" => VersionConstraint::Equal(version),
-        _ => unreachable!(),
-    })
-}
-fn normalize_constraint_version(value: &str) -> Result<String> {
-    let (main, suffix) = value
-        .split_once('-')
-        .map_or((value, None), |(main, suffix)| (main, Some(suffix)));
-    let parts = main.split('.').collect::<Vec<_>>();
-    if parts.is_empty()
-        || parts.len() > 3
-        || !parts
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-        bail!("invalid constraint version {value:?}")
-    }
-    let mut normalized = parts.join(".");
-    for _ in parts.len()..3 {
-        normalized.push_str(".0");
-    }
-    if let Some(suffix) = suffix {
-        normalized.push('-');
-        normalized.push_str(suffix);
-    }
-    Ok(normalized)
 }
 
 fn insert_payload(
@@ -1148,33 +1059,12 @@ fn validate_platform_id(value: &str) -> Result<()> {
     }
     Ok(())
 }
-fn validate_version(version: &str) -> Result<()> {
-    let (main, build) = version
-        .split_once('+')
-        .map_or((version, None), |(main, build)| (main, Some(build)));
-    let (main, pre) = main
-        .split_once('-')
-        .map_or((main, None), |(main, pre)| (main, Some(pre)));
-    let numeric = |part: &str| {
-        !part.is_empty()
-            && part.bytes().all(|byte| byte.is_ascii_digit())
-            && (part == "0" || !part.starts_with('0'))
-    };
-    let main_parts = main.split('.').collect::<Vec<_>>();
-    let identifier = |part: &str| {
-        !part.is_empty()
-            && part
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    };
-    if main_parts.len() != 3
-        || !main_parts.iter().all(|part| numeric(part))
-        || pre.is_some_and(|value| !value.split('.').all(identifier))
-        || build.is_some_and(|value| !value.split('.').all(identifier))
-    {
-        bail!("version must be SemVer: {version:?}")
-    }
-    Ok(())
+fn validate_version(value: &str) -> Result<()> {
+    // `semver::Version::parse` requires exactly three numeric components
+    // (no "1.2" shorthand) and already rejects a leading zero in any
+    // numeric identifier, matching the rules this function used to
+    // implement by hand.
+    version::validate_version(value)
 }
 fn validate_payload_path(value: &str) -> Result<()> {
     let path = Path::new(value);
