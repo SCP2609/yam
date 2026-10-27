@@ -402,3 +402,74 @@ fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
     }
     std::cmp::Ordering::Equal
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn index_with(versions: &[&str]) -> PackageIndex {
+        PackageIndex {
+            format: 2,
+            name: "yam/base".into(),
+            versions: versions
+                .iter()
+                .map(|version| {
+                    (
+                        version.to_string(),
+                        VersionMetadata {
+                            artifacts: BTreeMap::new(),
+                            published_at: None,
+                            depends: Vec::new(),
+                            recommends: Vec::new(),
+                            provides: Vec::new(),
+                            conflicts: Vec::new(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn an_explicit_prerelease_pin_can_be_selected_as_a_dependency() {
+        // docs/PACKAGING.md and AGENTS.md agree a pre-release is only ever
+        // selected when pinned explicitly. select_version's own filter
+        // (`!version.contains('-')`) runs unconditionally, even for an
+        // exact `=` pin, so a dependency on "=1.5.0-rc.1" can never
+        // resolve even though the registry published exactly that
+        // version.
+        let index = index_with(&["1.5.0-rc.1"]);
+        let result = select_version(&index, &["=1.5.0-rc.1"]);
+        assert!(
+            result.is_ok(),
+            "an explicit =X.Y.Z-pre dependency constraint must resolve to that pre-release, got {result:?}"
+        );
+        assert_eq!(result.unwrap(), "1.5.0-rc.1");
+    }
+
+    // Characterization tests: this behavior is already correct today and
+    // must stay correct once select_version is switched to version.rs.
+    #[test]
+    fn caret_excludes_the_next_minor_for_a_zero_major() {
+        let index = index_with(&["0.2.5", "0.3.0"]);
+        assert_eq!(select_version(&index, &["^0.2"]).unwrap(), "0.2.5");
+    }
+
+    #[test]
+    fn tilde_excludes_the_next_minor() {
+        let index = index_with(&["1.2.9", "1.3.0"]);
+        assert_eq!(select_version(&index, &["~1.2"]).unwrap(), "1.2.9");
+    }
+
+    #[test]
+    fn compound_constraints_pick_the_highest_match() {
+        let index = index_with(&["1.0.0", "1.9.9", "2.0.0"]);
+        assert_eq!(select_version(&index, &[">=1", "<2"]).unwrap(), "1.9.9");
+    }
+
+    #[test]
+    fn default_selection_never_picks_a_prerelease() {
+        let index = index_with(&["1.0.0", "1.1.0-rc.1"]);
+        assert_eq!(select_version(&index, &[]).unwrap(), "1.0.0");
+    }
+}
