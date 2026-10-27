@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
+    io::{Read, Write},
     path::Path,
 };
 use url::Url;
@@ -189,26 +190,51 @@ pub fn select_artifact(
     }
     Ok((version, artifact))
 }
-pub fn download_artifact(registry: &Registry, artifact: &Artifact) -> Result<Vec<u8>> {
+/// Download `artifact` straight into `destination`, hashing it as it's
+/// written rather than buffering the whole thing in memory first (B4):
+/// an artifact can be large, and nothing here should hold more than one
+/// chunk of it in RAM at a time. Bails as soon as more bytes arrive than
+/// the signed index declared, rather than after the fact.
+pub fn download_artifact(
+    registry: &Registry,
+    artifact: &Artifact,
+    destination: &Path,
+) -> Result<()> {
     let url = Url::parse(&artifact.url)
         .or_else(|_| Url::parse(&format!("{}/", registry.url))?.join(&artifact.url))?;
     if url.scheme() != "https" {
         bail!("artifact URL must use HTTPS")
     }
-    let response = Client::builder()
+    let mut response = Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .build()?
         .get(url)
         .send()?
         .error_for_status()?;
-    let bytes = response.bytes()?.to_vec();
-    if bytes.len() as u64 != artifact.size {
+    let mut file = fs::File::create(destination)
+        .with_context(|| format!("create {}", destination.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut downloaded: u64 = 0;
+    loop {
+        let read = response.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        downloaded += read as u64;
+        if downloaded > artifact.size {
+            bail!("artifact exceeded its declared size while downloading")
+        }
+        hasher.update(&buffer[..read]);
+        file.write_all(&buffer[..read])?;
+    }
+    if downloaded != artifact.size {
         bail!("artifact size mismatch")
     }
-    if format!("{:x}", Sha256::digest(&bytes)) != artifact.sha256 {
+    if format!("{:x}", hasher.finalize()) != artifact.sha256 {
         bail!("artifact checksum mismatch")
     }
-    Ok(bytes)
+    Ok(())
 }
 pub fn resolve(
     registry: &Registry,

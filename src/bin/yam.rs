@@ -274,9 +274,8 @@ fn install_registry_graph(
             .into_iter()
             .enumerate()
             .map(|(index, package)| {
-                let bytes = registry::download_artifact(registry_config, &package.artifact)?;
                 let path = download_dir.join(format!("{index}.yampkg"));
-                fs::write(&path, bytes)?;
+                registry::download_artifact(registry_config, &package.artifact, &path)?;
                 Ok((package, path))
             })
             .collect()
