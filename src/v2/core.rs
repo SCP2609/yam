@@ -4,7 +4,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fs,
     io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
@@ -13,6 +13,7 @@ use std::{
 use tar::{Archive, Builder, Header};
 use uuid::Uuid;
 
+use super::registry;
 use super::version;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -802,6 +803,31 @@ impl Manager {
             })?
             .collect::<rusqlite::Result<_>>()?;
         Ok(packages)
+    }
+
+    /// A snapshot of what's installed, for the registry resolver (B2)
+    /// to tell an already-satisfied dependency or short name from one
+    /// it actually needs to resolve.
+    pub fn installed_snapshot(&self) -> Result<registry::InstalledSnapshot> {
+        let mut packages = BTreeMap::new();
+        let mut statement = self.db.prepare("SELECT name, version FROM packages")?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (name, version) = row?;
+            packages.insert(name, version::parse_version(&version)?);
+        }
+        let mut provides: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        let mut statement = self
+            .db
+            .prepare("SELECT capability, package_name FROM provides")?;
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (capability, package_name) = row?;
+            provides.entry(capability).or_default().insert(package_name);
+        }
+        Ok(registry::InstalledSnapshot { packages, provides })
     }
 
     pub fn files(&self, name: &str) -> Result<Vec<String>> {

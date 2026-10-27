@@ -163,45 +163,6 @@ pub fn package_index(registry: &Registry, name: &str) -> Result<PackageIndex> {
     }
     Ok(index)
 }
-pub fn select_artifact(
-    index: &PackageIndex,
-    requested: Option<&str>,
-    profile: &PlatformProfile,
-) -> Result<(String, Artifact)> {
-    let version = match requested {
-        Some(version) => version.to_owned(),
-        None => index
-            .versions
-            .keys()
-            .filter_map(|key| version::parse_version(key).ok().map(|parsed| (parsed, key)))
-            .filter(|(parsed, _)| parsed.pre.is_empty())
-            .max_by(|left, right| left.0.cmp(&right.0))
-            .map(|(_, key)| key.clone())
-            .context("registry has no stable versions")?,
-    };
-    let metadata = index
-        .versions
-        .get(&version)
-        .context("package version not found")?;
-    let artifact = metadata
-        .artifacts
-        .get(&profile.id)
-        .or_else(|| metadata.artifacts.get("any"))
-        .context("package version has no artifact for this platform")?
-        .clone();
-    if artifact.arch != profile.arch {
-        bail!(
-            "artifact architecture {} does not match {}",
-            artifact.arch,
-            profile.arch
-        )
-    }
-    if artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        bail!("invalid artifact SHA-256")
-    }
-    Ok((version, artifact))
-}
 /// Download `artifact` straight into `destination`, hashing it as it's
 /// written rather than buffering the whole thing in memory first (B4):
 /// an artifact can be large, and nothing here should hold more than one
@@ -559,73 +520,6 @@ fn pick_version(index: &PackageIndex, constraints: &version::Constraints) -> Res
         .context("no registry version satisfies the requested constraints")
 }
 
-pub fn resolve(
-    registry: &Registry,
-    requested: &str,
-    requested_version: Option<&str>,
-    profile: &PlatformProfile,
-) -> Result<Vec<ResolvedPackage>> {
-    let mut resolved = Vec::new();
-    let mut completed = BTreeSet::new();
-    let mut visiting = BTreeSet::new();
-    resolve_one(
-        registry,
-        requested,
-        requested_version,
-        profile,
-        &mut resolved,
-        &mut completed,
-        &mut visiting,
-    )?;
-    Ok(resolved)
-}
-fn resolve_one(
-    registry: &Registry,
-    name: &str,
-    requested_version: Option<&str>,
-    profile: &PlatformProfile,
-    resolved: &mut Vec<ResolvedPackage>,
-    completed: &mut BTreeSet<String>,
-    visiting: &mut BTreeSet<String>,
-) -> Result<()> {
-    if completed.contains(name) {
-        return Ok(());
-    }
-    if !name.contains('/') {
-        bail!("virtual dependency {name:?} requires a registry provider policy")
-    }
-    if !visiting.insert(name.into()) {
-        bail!("dependency cycle detected at {name}")
-    }
-    let index = package_index(registry, name)?;
-    let (version, artifact) = select_artifact(&index, requested_version, profile)?;
-    let metadata = index
-        .versions
-        .get(&version)
-        .expect("selected version exists");
-    for requirement in &metadata.depends {
-        let (dependency, constraints) = split_requirement(requirement)?;
-        let dependency_index = package_index(registry, dependency)?;
-        let selected = select_version(&dependency_index, &constraints)?;
-        resolve_one(
-            registry,
-            dependency,
-            Some(&selected),
-            profile,
-            resolved,
-            completed,
-            visiting,
-        )?;
-    }
-    visiting.remove(name);
-    completed.insert(name.into());
-    resolved.push(ResolvedPackage {
-        name: name.into(),
-        version,
-        artifact,
-    });
-    Ok(())
-}
 fn split_requirement(value: &str) -> Result<(&str, Vec<&str>)> {
     let mut words = value.split_whitespace();
     let name = words.next().context("empty dependency")?;
@@ -639,10 +533,10 @@ fn split_requirement(value: &str) -> Result<(&str, Vec<&str>)> {
     }
     Ok((name, constraints))
 }
-/// Highest published version matching every constraint. A pre-release is
-/// only matched when a constraint pins to it explicitly at the same
-/// major.minor.patch (`version::Constraints`/`semver::VersionReq`'s own
-/// rule); no separate dash-based filter is needed or applied here.
+/// Test-only convenience over `pick_version`, taking the same
+/// space-separated constraint words the B5 tests below were written
+/// against.
+#[cfg(test)]
 fn select_version(index: &PackageIndex, constraints: &[&str]) -> Result<String> {
     let parsed = version::Constraints::parse(&constraints.join(" "))?;
     index

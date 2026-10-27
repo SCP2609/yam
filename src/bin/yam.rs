@@ -232,7 +232,15 @@ fn main() -> Result<()> {
                 Command::Plan { package } => {
                     let (name, version) = split_package_version(&package)?;
                     let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
-                    let packages = registry::resolve(&selected, name, version, manager.profile())?;
+                    let installed = manager.installed_snapshot()?;
+                    let mut source = registry::LiveSource::new(&selected);
+                    let packages = registry::resolve_with(
+                        &mut source,
+                        name,
+                        version,
+                        manager.profile(),
+                        &installed,
+                    )?;
                     for package in packages {
                         println!(
                             "{}\t{}\t{}",
@@ -258,7 +266,15 @@ fn install_registry_graph(
     version: Option<&str>,
     yes: bool,
 ) -> Result<yam::v2::PackageManifest> {
-    let graph = registry::resolve(registry_config, name, version, manager.profile())?;
+    let installed_snapshot = manager.installed_snapshot()?;
+    let mut source = registry::LiveSource::new(registry_config);
+    let graph = registry::resolve_with(
+        &mut source,
+        name,
+        version,
+        manager.profile(),
+        &installed_snapshot,
+    )?;
     let installed = manager
         .list()?
         .into_iter()
