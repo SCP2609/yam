@@ -678,15 +678,19 @@ impl Manager {
     pub fn repair(&self) -> Result<Vec<String>> {
         let mut statement = self
             .db
-            .prepare("SELECT path,target FROM links ORDER BY path")?;
+            .prepare("SELECT path,target,package_name FROM links ORDER BY path")?;
         let links = statement
             .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let payload_root = self.root.join("pkgs");
         let mut repaired = Vec::new();
-        for (path, target) in links {
+        for (path, target, package_name) in links {
             validate_payload_path(&path)?;
             let link = self.root.join(&path);
             let target = PathBuf::from(target);
@@ -700,6 +704,19 @@ impl Manager {
                 bail!("cannot repair {path}: it is not a YAM link")
             }
             if link.is_symlink() {
+                let (namespace, name) = split_name(&package_name)?;
+                let own_payload = payload_root.join(namespace).join(name);
+                let current = fs::read_link(&link).ok();
+                let safe_to_replace = current
+                    .as_ref()
+                    .is_none_or(|current| !current.exists() || current.starts_with(&own_payload));
+                if !safe_to_replace {
+                    bail!(
+                        "cannot repair {path}: existing symlink points outside {}'s own payload ({})",
+                        package_name,
+                        describe_obstruction(&link)
+                    )
+                }
                 fs::remove_file(&link)?;
             }
             if let Some(parent) = link.parent() {
