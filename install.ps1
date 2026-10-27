@@ -59,6 +59,14 @@ try {
         & adb -s $serial push $profileFile "$deviceRoot/platforms/$profile.yaml" | Out-Null
     }
     & adb -s $serial shell "chmod 0755 '$deviceRoot/bin/yam.new'; mv '$deviceRoot/bin/yam.new' '$deviceRoot/bin/yam'" | Out-Null
+    $runner = @"
+#!/bin/sh
+export YAM_PLATFORM='$Platform'
+export YAM_PROFILES='$deviceRoot/platforms'
+exec '$deviceRoot/bin/yam' "`$@"
+"@
+    $runner64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($runner))
+    & adb -s $serial shell "echo '$runner64' | base64 -d > '$deviceRoot/bin/yam-run'; chmod 0755 '$deviceRoot/bin/yam-run'" | Out-Null
     if ($Platform -eq "yandexmicro") {
         $bootScript = @"
 #!/bin/sh
@@ -67,19 +75,19 @@ platform='$Platform'
 case "`${1:-}" in
   start)
     [ -x "`$root/bin/yam" ] || exit 0
-    ln -sfn "`$root/bin/yam" /usr/bin/yam
-    /usr/bin/yam --platform "`$platform" --profiles "`$root/platforms" update || true
+    ln -sfn "`$root/bin/yam-run" /usr/bin/yam
+    /usr/bin/yam update || true
     ;;
 esac
 "@
         $bootScript64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootScript))
-        $bootCommand = "set -eu; mount -o remount,rw /; trap 'mount -o remount,ro /' EXIT; if [ -e /usr/bin/yam ] && [ ! -L /usr/bin/yam ]; then exit 1; fi; ln -sfn '$deviceRoot/bin/yam' /usr/bin/yam; echo '$bootScript64' | base64 -d > /etc/init.d/S99yam; chmod 0755 /etc/init.d/S99yam"
+        $bootCommand = "set -eu; mount -o remount,rw /; trap 'mount -o remount,ro /' EXIT; if [ -e /usr/bin/yam ] && { [ ! -L /usr/bin/yam ] || [ `$(readlink /usr/bin/yam) != '$deviceRoot/bin/yam-run' ]; }; then exit 1; fi; ln -sfn '$deviceRoot/bin/yam-run' /usr/bin/yam; echo '$bootScript64' | base64 -d > /etc/init.d/S99yam; chmod 0755 /etc/init.d/S99yam"
         & adb -s $serial shell $bootCommand | Out-Null
     } else {
         Write-Warning "Автообновление при загрузке настроено только для yandexmicro."
     }
     Write-Host "YAM установлен: $deviceRoot/bin/yam"
-    Write-Host "Пример: adb -s $serial shell 'yam --platform $Platform --profiles $deviceRoot/platforms list'"
+    Write-Host "Пример: adb -s $serial shell 'yam list'"
 } finally {
     if (Test-Path $tmp) { Remove-Item -Force -Recurse $tmp }
 }

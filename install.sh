@@ -79,15 +79,17 @@ for profile in yandexmicro yandexmini_2 yandexmidi yandexplum; do
   adb -s "$DEVICE" push "$TMPDIR_INSTALL/$profile.yaml" "$DEVICE_ROOT/platforms/$profile.yaml" </dev/null >/dev/null
 done
 adb -s "$DEVICE" shell "chmod 0755 '$DEVICE_ROOT/bin/yam.new'; mv '$DEVICE_ROOT/bin/yam.new' '$DEVICE_ROOT/bin/yam'" </dev/null
+runner64=$(printf '%s\n' '#!/bin/sh' "export YAM_PLATFORM='$PLATFORM'" "export YAM_PROFILES='$DEVICE_ROOT/platforms'" "exec '$DEVICE_ROOT/bin/yam' \"\$@\"" | base64 | tr -d '\n')
+adb -s "$DEVICE" shell "echo '$runner64' | base64 -d > '$DEVICE_ROOT/bin/yam-run'; chmod 0755 '$DEVICE_ROOT/bin/yam-run'" </dev/null
 
 if [ "$PLATFORM" = yandexmicro ]; then
   adb -s "$DEVICE" shell "set -eu
     mount -o remount,rw /
     trap 'mount -o remount,ro /' EXIT
-    if [ -e /usr/bin/yam ] && [ ! -L /usr/bin/yam ]; then
-      echo '/usr/bin/yam already exists and is not a YAM link' >&2; exit 1
+    if [ -e /usr/bin/yam ] && { [ ! -L /usr/bin/yam ] || [ \"\$(readlink /usr/bin/yam)\" != '$DEVICE_ROOT/bin/yam-run' ]; }; then
+      echo '/usr/bin/yam already belongs to another program' >&2; exit 1
     fi
-    ln -sfn '$DEVICE_ROOT/bin/yam' /usr/bin/yam
+    ln -sfn '$DEVICE_ROOT/bin/yam-run' /usr/bin/yam
     cat >/etc/init.d/S99yam <<'HOOK'
 #!/bin/sh
 root='$DEVICE_ROOT'
@@ -95,8 +97,8 @@ platform='$PLATFORM'
 case \"\${1:-}\" in
   start)
     [ -x \"\$root/bin/yam\" ] || exit 0
-    ln -sfn \"\$root/bin/yam\" /usr/bin/yam
-    /usr/bin/yam --platform \"\$platform\" --profiles \"\$root/platforms\" update || true
+    ln -sfn "\$root/bin/yam-run" /usr/bin/yam
+    /usr/bin/yam update || true
     ;;
 esac
 HOOK
