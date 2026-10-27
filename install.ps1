@@ -1,7 +1,8 @@
 param(
     [string]$Version = $(if ($env:YAM_VERSION) { $env:YAM_VERSION } else { "latest" }),
     [string]$StationIp,
-    [string]$Platform = $(if ($env:YAM_PLATFORM) { $env:YAM_PLATFORM } else { "yandexmicro" })
+    [string]$Platform = $(if ($env:YAM_PLATFORM) { $env:YAM_PLATFORM } else { "yandexmicro" }),
+    [switch]$RemoveOld
 )
 
 $ErrorActionPreference = "Stop"
@@ -46,6 +47,25 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ("yam-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     $serial = Get-Device
+    if ($RemoveOld) {
+        if ($deviceRoot -eq "/data/quazar/yam") { throw "YAM_ROOT не может указывать на legacy-каталог с -RemoveOld." }
+        $legacyCleanup = @'
+set -eu
+legacy=/data/quazar/yam
+if [ -r "$legacy/yamd.pid" ]; then
+  pid=$(cat "$legacy/yamd.pid" 2>/dev/null || true)
+  case "$pid" in ""|*[!0-9]*) ;; *) kill "$pid" 2>/dev/null || true ;; esac
+fi
+mount -o remount,rw /
+trap "mount -o remount,ro /" EXIT
+if [ -f /etc/init.d/S99yam ] && grep -q "/data/quazar/yam" /etc/init.d/S99yam; then
+  rm -f /etc/init.d/S99yam
+fi
+rm -rf "$legacy"
+'@
+        & adb -s $serial shell $legacyCleanup | Out-Null
+        Write-Host "Удалены legacy yamd и его данные из /data/quazar/yam."
+    }
     $asset = "yam-aarch64-unknown-linux-musl"
     $checksums = Join-Path $tmp "SHA256SUMS"
     $binary = Join-Path $tmp $asset

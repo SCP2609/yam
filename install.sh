@@ -1,10 +1,29 @@
 #!/bin/sh
 set -eu
 
-VERSION=${1:-${YAM_VERSION:-latest}}
+VERSION=${YAM_VERSION:-latest}
+REMOVE_OLD=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --remove-old) REMOVE_OLD=1 ;;
+    --help|-h)
+      echo 'Использование: install.sh [версия] [--remove-old]'
+      echo '  --remove-old  удалить legacy yamd из /data/quazar/yam'
+      exit 0
+      ;;
+    -*) echo "Неизвестный флаг: $1" >&2; exit 2 ;;
+    *) VERSION=$1 ;;
+  esac
+  shift
+done
 REPOSITORY=https://github.com/nyakokitsu/yam
 DEVICE_ROOT=${YAM_ROOT:-/data/yam}
 PLATFORM=${YAM_PLATFORM:-yandexmicro}
+
+if [ "$REMOVE_OLD" -eq 1 ] && [ "$DEVICE_ROOT" = /data/quazar/yam ]; then
+  echo 'YAM_ROOT не может указывать на legacy-каталог при --remove-old.' >&2
+  exit 2
+fi
 
 TMPDIR_INSTALL=$(mktemp -d "${TMPDIR:-/tmp}/yam.XXXXXX")
 trap 'rm -rf "$TMPDIR_INSTALL"' EXIT HUP INT TERM
@@ -77,6 +96,22 @@ if [ -z "$DEVICE" ]; then
   DEVICE="$ip:5555"
   adb connect "$DEVICE" </dev/null >&2
   adb -s "$DEVICE" get-state </dev/null >/dev/null
+fi
+
+if [ "$REMOVE_OLD" -eq 1 ]; then
+  adb -s "$DEVICE" shell 'set -eu
+    legacy=/data/quazar/yam
+    if [ -r "$legacy/yamd.pid" ]; then
+      pid=$(cat "$legacy/yamd.pid" 2>/dev/null || true)
+      case "$pid" in ""|*[!0-9]*) ;; *) kill "$pid" 2>/dev/null || true ;; esac
+    fi
+    mount -o remount,rw /
+    trap "mount -o remount,ro /" EXIT
+    if [ -f /etc/init.d/S99yam ] && grep -q "/data/quazar/yam" /etc/init.d/S99yam; then
+      rm -f /etc/init.d/S99yam
+    fi
+    rm -rf "$legacy"' </dev/null
+  echo 'Удалены legacy yamd и его данные из /data/quazar/yam.' >&2
 fi
 
 ASSET=yam-aarch64-unknown-linux-musl
