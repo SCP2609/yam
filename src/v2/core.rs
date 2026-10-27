@@ -1585,4 +1585,73 @@ mod tests {
         );
         assert!(manager.list().unwrap().is_empty());
     }
+
+    #[test]
+    fn installing_a_package_that_declares_a_dependency_succeeds() {
+        // Found while writing the B5 test below, not part of the original
+        // A1-B6 list: install_payload inserts into `dependencies` (and
+        // `provides`/`services`) before it inserts the package's own row
+        // into `packages`, even on a first-time install. Those tables'
+        // `package_name` columns are `REFERENCES packages(name)` and
+        // foreign_keys is on, so SQLite rejects the dependency row before
+        // the package row exists.
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let base_artifact = workdir.path().join("base.yampkg");
+        TestPackage::new("yam/base", "1.0.0")
+            .file("bin/base-tool", b"base payload")
+            .pack(&workdir.path().join("base-src"), &profile, &base_artifact)
+            .unwrap();
+
+        let app_artifact = workdir.path().join("app.yampkg");
+        TestPackage::new("yam/app", "1.0.0")
+            .file("bin/app-tool", b"app payload")
+            .depends("yam/base >=1.0.0")
+            .pack(&workdir.path().join("app-src"), &profile, &app_artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root, profile).unwrap();
+        manager.install(&base_artifact, true).unwrap();
+        manager
+            .install(&app_artifact, true)
+            .expect("installing a package with a satisfied dependency must succeed");
+    }
+
+    #[test]
+    fn a_prerelease_never_implicitly_satisfies_a_stable_at_least_constraint() {
+        // core.rs's own `Version` derives Ord over (major, minor, patch,
+        // pre: Option<String>). Option's derived Ord puts `None` below
+        // `Some(_)`, so "1.5.0" (pre: None) compares as LESS than
+        // "1.5.0-rc.1" (pre: Some("rc.1")) -- backwards from SemVer,
+        // where a release must sort above its own pre-releases. That
+        // makes `AtLeast(1.5.0)` (">=1.5.0") wrongly match an installed
+        // "1.5.0-rc.1".
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let base_artifact = workdir.path().join("base.yampkg");
+        TestPackage::new("yam/base", "1.5.0-rc.1")
+            .file("bin/base-tool", b"base payload")
+            .pack(&workdir.path().join("base-src"), &profile, &base_artifact)
+            .unwrap();
+
+        let app_artifact = workdir.path().join("app.yampkg");
+        TestPackage::new("yam/app", "1.0.0")
+            .file("bin/app-tool", b"app payload")
+            .depends("yam/base >=1.5.0")
+            .pack(&workdir.path().join("app-src"), &profile, &app_artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root, profile).unwrap();
+        manager.install(&base_artifact, true).unwrap();
+
+        let result = manager.install(&app_artifact, true);
+        assert!(
+            result.is_err(),
+            "a pre-release (1.5.0-rc.1) must never satisfy >=1.5.0, got {result:?}"
+        );
+    }
 }
