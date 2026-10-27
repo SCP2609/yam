@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     io::{Cursor, Read, Write},
     path::{Component, Path, PathBuf},
@@ -745,6 +745,7 @@ impl Manager {
 
     pub fn doctor(&self) -> Result<Vec<String>> {
         let mut problems = Vec::new();
+        let mut known_paths = HashSet::new();
         let mut statement = self
             .db
             .prepare("SELECT path,package_name,target FROM links ORDER BY path")?;
@@ -762,7 +763,98 @@ impl Manager {
                     "{path}: link owned by {package} is missing or points elsewhere"
                 ));
             }
+            known_paths.insert(path);
         }
+
+        // A symlink into pkgs/ that the links table never recorded --
+        // left over from an interrupted install/remove, or planted by
+        // hand.
+        let pkgs_root = self.root.join("pkgs");
+        for tree in ["bin", "share"] {
+            let base = self.root.join(tree);
+            if !base.is_dir() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(&base) {
+                let entry = entry?;
+                if !entry.file_type().is_symlink() {
+                    continue;
+                }
+                let Ok(relative) = entry.path().strip_prefix(&self.root) else {
+                    continue;
+                };
+                let relative = relative.to_string_lossy().to_string();
+                if known_paths.contains(&relative) {
+                    continue;
+                }
+                if fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(&pkgs_root)) {
+                    problems.push(format!(
+                        "{relative}: symlink into pkgs/ is not recorded in the link database"
+                    ));
+                }
+            }
+        }
+
+        // Version directories under pkgs/ that don't match what's
+        // recorded as current, and packages recorded as installed whose
+        // payload directory is gone.
+        let mut current_versions = HashMap::new();
+        let mut package_statement = self.db.prepare("SELECT name,version FROM packages")?;
+        for row in package_statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (name, version) = row?;
+            current_versions.insert(name, version);
+        }
+        if pkgs_root.is_dir() {
+            for namespace_entry in fs::read_dir(&pkgs_root)? {
+                let namespace_entry = namespace_entry?;
+                if !namespace_entry.file_type()?.is_dir() {
+                    continue;
+                }
+                let namespace = namespace_entry.file_name().to_string_lossy().to_string();
+                for name_entry in fs::read_dir(namespace_entry.path())? {
+                    let name_entry = name_entry?;
+                    if !name_entry.file_type()?.is_dir() {
+                        continue;
+                    }
+                    let name = name_entry.file_name().to_string_lossy().to_string();
+                    let full_name = format!("{namespace}/{name}");
+                    let Some(current) = current_versions.get(&full_name) else {
+                        problems.push(format!(
+                            "pkgs/{full_name}: on disk but not recorded in the database"
+                        ));
+                        continue;
+                    };
+                    for version_entry in fs::read_dir(name_entry.path())? {
+                        let version_entry = version_entry?;
+                        if !version_entry.file_type()?.is_dir() {
+                            continue;
+                        }
+                        let version = version_entry.file_name().to_string_lossy().to_string();
+                        if &version != current {
+                            problems.push(format!(
+                                "pkgs/{full_name}/{version}: stale version directory, current is {current}"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for (name, version) in &current_versions {
+            let (namespace, package) = split_name(name)?;
+            if !pkgs_root
+                .join(namespace)
+                .join(package)
+                .join(version)
+                .is_dir()
+            {
+                problems.push(format!(
+                    "{name} {version}: recorded in the database but payload directory is missing"
+                ));
+            }
+        }
+
         Ok(problems)
     }
 
