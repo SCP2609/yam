@@ -1,6 +1,7 @@
 param(
     [string]$Version = $(if ($env:YAM_VERSION) { $env:YAM_VERSION } else { "latest" }),
-    [string]$StationIp
+    [string]$StationIp,
+    [string]$Platform = $(if ($env:YAM_PLATFORM) { $env:YAM_PLATFORM } else { "yandexmicro" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -58,8 +59,27 @@ try {
         & adb -s $serial push $profileFile "$deviceRoot/platforms/$profile.yaml" | Out-Null
     }
     & adb -s $serial shell "chmod 0755 '$deviceRoot/bin/yam.new'; mv '$deviceRoot/bin/yam.new' '$deviceRoot/bin/yam'" | Out-Null
+    if ($Platform -eq "yandexmicro") {
+        $bootScript = @"
+#!/bin/sh
+root='$deviceRoot'
+platform='$Platform'
+case "`${1:-}" in
+  start)
+    [ -x "`$root/bin/yam" ] || exit 0
+    ln -sfn "`$root/bin/yam" /usr/bin/yam
+    /usr/bin/yam --platform "`$platform" --profiles "`$root/platforms" update || true
+    ;;
+esac
+"@
+        $bootScript64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootScript))
+        $bootCommand = "set -eu; mount -o remount,rw /; trap 'mount -o remount,ro /' EXIT; if [ -e /usr/bin/yam ] && [ ! -L /usr/bin/yam ]; then exit 1; fi; ln -sfn '$deviceRoot/bin/yam' /usr/bin/yam; echo '$bootScript64' | base64 -d > /etc/init.d/S99yam; chmod 0755 /etc/init.d/S99yam"
+        & adb -s $serial shell $bootCommand | Out-Null
+    } else {
+        Write-Warning "Автообновление при загрузке настроено только для yandexmicro."
+    }
     Write-Host "YAM установлен: $deviceRoot/bin/yam"
-    Write-Host "Пример: adb -s $serial shell '$deviceRoot/bin/yam --platform yandexmicro --profiles $deviceRoot/platforms list'"
+    Write-Host "Пример: adb -s $serial shell 'yam --platform $Platform --profiles $deviceRoot/platforms list'"
 } finally {
     if (Test-Path $tmp) { Remove-Item -Force -Recurse $tmp }
 }

@@ -4,6 +4,7 @@ set -eu
 VERSION=${1:-${YAM_VERSION:-latest}}
 REPOSITORY=https://github.com/nyakokitsu/yam
 DEVICE_ROOT=${YAM_ROOT:-/data/yam}
+PLATFORM=${YAM_PLATFORM:-yandexmicro}
 
 case "$VERSION" in
   latest) RELEASE_URL="$REPOSITORY/releases/latest/download"; SOURCE_REF=v2 ;;
@@ -79,5 +80,30 @@ for profile in yandexmicro yandexmini_2 yandexmidi yandexplum; do
 done
 adb -s "$DEVICE" shell "chmod 0755 '$DEVICE_ROOT/bin/yam.new'; mv '$DEVICE_ROOT/bin/yam.new' '$DEVICE_ROOT/bin/yam'" </dev/null
 
+if [ "$PLATFORM" = yandexmicro ]; then
+  adb -s "$DEVICE" shell "set -eu
+    mount -o remount,rw /
+    trap 'mount -o remount,ro /' EXIT
+    if [ -e /usr/bin/yam ] && [ ! -L /usr/bin/yam ]; then
+      echo '/usr/bin/yam already exists and is not a YAM link' >&2; exit 1
+    fi
+    ln -sfn '$DEVICE_ROOT/bin/yam' /usr/bin/yam
+    cat >/etc/init.d/S99yam <<'HOOK'
+#!/bin/sh
+root='$DEVICE_ROOT'
+platform='$PLATFORM'
+case \"\${1:-}\" in
+  start)
+    [ -x \"\$root/bin/yam\" ] || exit 0
+    ln -sfn \"\$root/bin/yam\" /usr/bin/yam
+    /usr/bin/yam --platform \"\$platform\" --profiles \"\$root/platforms\" update || true
+    ;;
+esac
+HOOK
+    chmod 0755 /etc/init.d/S99yam" </dev/null
+else
+  echo "Автообновление при загрузке настроено только для yandexmicro; используйте: yam --platform $PLATFORM --profiles $DEVICE_ROOT/platforms update" >&2
+fi
+
 echo "YAM установлен на $DEVICE: $DEVICE_ROOT/bin/yam"
-echo "Пример: adb -s $DEVICE shell '$DEVICE_ROOT/bin/yam --platform yandexmicro --profiles $DEVICE_ROOT/platforms list'"
+echo "Пример: adb -s $DEVICE shell 'yam --platform $PLATFORM --profiles $DEVICE_ROOT/platforms list'"

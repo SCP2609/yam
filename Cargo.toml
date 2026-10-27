@@ -7,6 +7,10 @@ edition = "2021"
 name = "yam"
 path = "src/bin/yam.rs"
 
+[[bin]]
+name = "yam-sign-update"
+path = "src/bin/yam_sign_update.rs"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"

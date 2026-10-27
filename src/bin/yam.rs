@@ -7,6 +7,7 @@ use std::{
 };
 use uuid::Uuid;
 use yam::v2::registry;
+use yam::v2::update::{self, UpdateResult};
 use yam::v2::{Manager, PlatformProfile};
 
 #[derive(Parser)]
@@ -52,6 +53,7 @@ enum Command {
     },
     Doctor,
     Repair,
+    Update,
     Entware {
         #[command(subcommand)]
         command: EntwareCommand,
@@ -159,6 +161,12 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                Command::Update => match update::apply()? {
+                    UpdateResult::Current(version) => {
+                        println!("Уже установлена актуальная версия {version}.")
+                    }
+                    UpdateResult::Updated(version) => println!("Установлено обновление {version}."),
+                },
                 Command::Entware { command } => match command {
                     EntwareCommand::Status => println!(
                         "{}",

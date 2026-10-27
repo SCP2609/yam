@@ -18,16 +18,18 @@ curl -fsSL https://hackalice.me/install.sh | sh
 irm https://hackalice.me/install.ps1 | iex
 ```
 
-Установщик подключается к колонке через ADB. Используйте yam через adb shell
+Установщик подключается к колонке через ADB. Публикуется только `yam` для
+`aarch64-unknown-linux-musl`; десктопных сборок нет.
 
 ## Использование
 
 ```sh
-yam list
-yam search namespace/package
-yam install namespace/package
-yam doctor
-yam repair
+yam --platform yandexmicro list
+yam --platform yandexmicro search namespace/package
+yam --platform yandexmicro install namespace/package
+yam --platform yandexmicro doctor
+yam --platform yandexmicro repair
+yam --platform yandexmicro update
 ```
 
 Для локальной проверки пакета укажите отдельный каталог:
@@ -42,4 +44,18 @@ yam --platform yandexmicro --root ./yam-root install --yes package.yampkg
 - [Реестр](docs/REGISTRY.md)
 
 Lua, Quasar, веб-интерфейс и старые `.yap`/`plugin.toml` находятся в отдельном
-пакете [`packages/yam-lua-runtime/`](packages/yam-lua-runtime/). В планах перевести runtime в отдельный репозиторий.
+пакете [`packages/yam-lua-runtime/`](packages/yam-lua-runtime/), а не в ядре YAM.
+
+## Обновление
+
+Установщик добавляет `/usr/bin/yam` на Micro и проверяет обновление при загрузке.
+Обновление принимается только при корректной Ed25519-подписи манифеста из
+GitHub Releases. Для публикации нужны repository variable `YAM_UPDATE_PUBLIC_KEY`
+и secret `YAM_UPDATE_SIGNING_KEY`.
+
+## Обновление
+
+Установщик добавляет `/usr/bin/yam` на Micro и проверяет обновление при загрузке.
+Обновление принимается только при корректной Ed25519-подписи манифеста из
+GitHub Releases. Для публикации нужны repository variable `YAM_UPDATE_PUBLIC_KEY`
+и secret `YAM_UPDATE_SIGNING_KEY`.
