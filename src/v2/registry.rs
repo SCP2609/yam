@@ -338,10 +338,20 @@ impl InstalledSnapshot {
 }
 
 /// `resolve`'s replacement, built on `IndexSource` so it can be unit
-/// tested against fixed data (B2). A full `ns/name` request resolves to
-/// exactly that package; a short name's resolution against `installed`
-/// and the catalogue's `yam/` providers is not implemented yet in this
-/// commit -- see the `TODO(B2)` in `resolve_one_with`.
+/// tested against fixed data (B2).
+///
+/// - A full `ns/name` request resolves to exactly that package.
+/// - A short name first checks `installed`; if nothing installed
+///   already satisfies it, the only `yam/<name>` package or `yam/*`
+///   provider is selected automatically. Multiple candidates, or
+///   candidates outside `yam/`, are reported rather than guessed.
+/// - A dependency already satisfied by something installed is skipped;
+///   the root request is always resolved, so `yam install foo` can
+///   upgrade an already-installed `foo` instead of becoming a
+///   permanent no-op. A short-named root is the exception: it is
+///   resolved against `installed` like any other short name, so
+///   `yam install spotify-connect` does nothing when it's already
+///   provided.
 pub fn resolve_with<S: IndexSource>(
     source: &mut S,
     requested: &str,
@@ -352,15 +362,20 @@ pub fn resolve_with<S: IndexSource>(
     let mut resolved = Vec::new();
     let mut completed = BTreeSet::new();
     let mut visiting = BTreeSet::new();
+    let constraints = match requested_version {
+        Some(version) => version::Constraints::parse(&format!("={version}"))?,
+        None => version::Constraints::any(),
+    };
     resolve_one_with(
         source,
         requested,
-        requested_version,
+        &constraints,
         profile,
         installed,
         &mut resolved,
         &mut completed,
         &mut visiting,
+        true,
     )?;
     Ok(resolved)
 }
@@ -369,42 +384,69 @@ pub fn resolve_with<S: IndexSource>(
 fn resolve_one_with<S: IndexSource>(
     source: &mut S,
     name: &str,
-    requested_version: Option<&str>,
+    constraints: &version::Constraints,
     profile: &PlatformProfile,
     installed: &InstalledSnapshot,
     resolved: &mut Vec<ResolvedPackage>,
     completed: &mut BTreeSet<String>,
     visiting: &mut BTreeSet<String>,
+    is_root: bool,
+) -> Result<()> {
+    if name.contains('/') {
+        resolve_full(
+            source,
+            name,
+            constraints,
+            profile,
+            installed,
+            resolved,
+            completed,
+            visiting,
+            is_root,
+        )
+    } else {
+        resolve_short(
+            source,
+            name,
+            constraints,
+            profile,
+            installed,
+            resolved,
+            completed,
+            visiting,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_full<S: IndexSource>(
+    source: &mut S,
+    name: &str,
+    constraints: &version::Constraints,
+    profile: &PlatformProfile,
+    installed: &InstalledSnapshot,
+    resolved: &mut Vec<ResolvedPackage>,
+    completed: &mut BTreeSet<String>,
+    visiting: &mut BTreeSet<String>,
+    is_root: bool,
 ) -> Result<()> {
     if completed.contains(name) {
         return Ok(());
     }
-    if !name.contains('/') {
-        // TODO(B2): resolve a short/virtual name against `installed`
-        // and the catalogue's yam/ providers instead of always
-        // refusing. Kept identical to the old resolve_one for now so
-        // introducing IndexSource is a pure refactor on its own.
-        bail!("virtual dependency {name:?} requires a registry provider policy")
+    if !is_root && installed.satisfies(name, constraints) {
+        completed.insert(name.to_owned());
+        return Ok(());
     }
-    if !visiting.insert(name.into()) {
+    if !visiting.insert(name.to_owned()) {
         bail!("dependency cycle detected at {name}")
     }
     let index = source.package_index(name)?.clone();
-    let version = match requested_version {
-        Some(version) => version.to_owned(),
-        None => index
-            .versions
-            .keys()
-            .filter_map(|key| version::parse_version(key).ok().map(|parsed| (parsed, key)))
-            .filter(|(parsed, _)| parsed.pre.is_empty())
-            .max_by(|left, right| left.0.cmp(&right.0))
-            .map(|(_, key)| key.clone())
-            .context("registry has no stable versions")?,
-    };
+    let version = pick_version(&index, constraints)
+        .with_context(|| format!("no version of {name} satisfies the request"))?;
     let metadata = index
         .versions
         .get(&version)
-        .context("package version not found")?
+        .expect("selected version exists")
         .clone();
     let artifact = metadata
         .artifacts
@@ -421,19 +463,17 @@ fn resolve_one_with<S: IndexSource>(
     }
     for requirement in &metadata.depends {
         let (dependency, constraint_words) = split_requirement(requirement)?;
-        // TODO(B2): skip a dependency installed already satisfies,
-        // same as the root (see the short-name TODO above).
-        let dependency_index = source.package_index(dependency)?;
-        let selected = select_version(dependency_index, &constraint_words)?;
+        let dependency_constraints = version::Constraints::parse(&constraint_words.join(" "))?;
         resolve_one_with(
             source,
             dependency,
-            Some(&selected),
+            &dependency_constraints,
             profile,
             installed,
             resolved,
             completed,
             visiting,
+            false,
         )?;
     }
     visiting.remove(name);
@@ -444,6 +484,79 @@ fn resolve_one_with<S: IndexSource>(
         artifact,
     });
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_short<S: IndexSource>(
+    source: &mut S,
+    name: &str,
+    constraints: &version::Constraints,
+    profile: &PlatformProfile,
+    installed: &InstalledSnapshot,
+    resolved: &mut Vec<ResolvedPackage>,
+    completed: &mut BTreeSet<String>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<()> {
+    if installed.satisfies(name, constraints) {
+        return Ok(());
+    }
+    let official = format!("yam/{name}");
+    let mut candidates = BTreeSet::new();
+    if source.package_index(&official).is_ok() {
+        candidates.insert(official);
+    }
+    let catalogue = source.catalogue()?.clone();
+    for entry in &catalogue.packages {
+        if entry.name.split('/').next() == Some("yam") && entry.provides.iter().any(|p| p == name) {
+            candidates.insert(entry.name.clone());
+        }
+    }
+    match candidates.len() {
+        0 => {
+            let others: Vec<&str> = catalogue
+                .packages
+                .iter()
+                .filter(|entry| entry.name.split('/').next() != Some("yam"))
+                .filter(|entry| {
+                    entry.name.ends_with(&format!("/{name}"))
+                        || entry.provides.iter().any(|p| p == name)
+                })
+                .map(|entry| entry.name.as_str())
+                .collect();
+            if others.is_empty() {
+                bail!("no registry package provides {name:?}")
+            }
+            bail!(
+                "{name:?} has no official yam/ provider; install one of these explicitly by full name: {}",
+                others.join(", ")
+            )
+        }
+        1 => {
+            let chosen = candidates.into_iter().next().expect("length checked");
+            resolve_one_with(
+                source, &chosen, constraints, profile, installed, resolved, completed, visiting,
+                false,
+            )
+        }
+        _ => bail!(
+            "{name:?} is provided by multiple yam/ packages: {}; install one explicitly by full name",
+            candidates.into_iter().collect::<Vec<_>>().join(", ")
+        ),
+    }
+}
+
+/// Highest version in `index` matching `constraints`. Relies on
+/// `Constraints::matches` to keep pre-releases out unless the caller
+/// pinned one explicitly (see `version.rs`).
+fn pick_version(index: &PackageIndex, constraints: &version::Constraints) -> Result<String> {
+    index
+        .versions
+        .keys()
+        .filter_map(|key| version::parse_version(key).ok().map(|v| (v, key.clone())))
+        .filter(|(version, _)| constraints.matches(version))
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, key)| key)
+        .context("no registry version satisfies the requested constraints")
 }
 
 pub fn resolve(
