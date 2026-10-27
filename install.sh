@@ -126,8 +126,14 @@ for profile in yandexmicro yandexmini_2 yandexmidi yandexplum; do
   adb -s "$DEVICE" push "$TMPDIR_INSTALL/$profile.yaml" "$DEVICE_ROOT/platforms/$profile.yaml" </dev/null >/dev/null
 done
 adb -s "$DEVICE" shell "chmod 0755 '$DEVICE_ROOT/bin/yam.new'; mv '$DEVICE_ROOT/bin/yam.new' '$DEVICE_ROOT/bin/yam'" </dev/null
-runner64=$(printf '%s\n' '#!/bin/sh' "export YAM_PLATFORM='$PLATFORM'" "export YAM_PROFILES='$DEVICE_ROOT/platforms'" "exec '$DEVICE_ROOT/bin/yam' \"\$@\"" | base64 | tr -d '\n')
-adb -s "$DEVICE" shell "echo '$runner64' | base64 -d > '$DEVICE_ROOT/bin/yam-run'; chmod 0755 '$DEVICE_ROOT/bin/yam-run'" </dev/null
+cat >"$TMPDIR_INSTALL/yam-run" <<EOF
+#!/bin/sh
+export YAM_PLATFORM='$PLATFORM'
+export YAM_PROFILES='$DEVICE_ROOT/platforms'
+exec '$DEVICE_ROOT/bin/yam' "\$@"
+EOF
+adb -s "$DEVICE" push "$TMPDIR_INSTALL/yam-run" "$DEVICE_ROOT/bin/yam-run.new" </dev/null >/dev/null
+adb -s "$DEVICE" shell "chmod 0755 '$DEVICE_ROOT/bin/yam-run.new'; mv '$DEVICE_ROOT/bin/yam-run.new' '$DEVICE_ROOT/bin/yam-run'; test -s '$DEVICE_ROOT/bin/yam-run'" </dev/null
 
 if [ "$PLATFORM" = yandexmicro ]; then
   adb -s "$DEVICE" shell "set -eu

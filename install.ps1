@@ -88,8 +88,10 @@ export YAM_PLATFORM='$Platform'
 export YAM_PROFILES='$deviceRoot/platforms'
 exec '$deviceRoot/bin/yam' "`$@"
 "@
-    $runner64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($runner))
-    & adb -s $serial shell "echo '$runner64' | base64 -d > '$deviceRoot/bin/yam-run'; chmod 0755 '$deviceRoot/bin/yam-run'" | Out-Null
+    $runnerPath = Join-Path $tmp "yam-run"
+    [IO.File]::WriteAllText($runnerPath, $runner, [Text.Encoding]::ASCII)
+    & adb -s $serial push $runnerPath "$deviceRoot/bin/yam-run.new" | Out-Null
+    & adb -s $serial shell "chmod 0755 '$deviceRoot/bin/yam-run.new'; mv '$deviceRoot/bin/yam-run.new' '$deviceRoot/bin/yam-run'; test -s '$deviceRoot/bin/yam-run'" | Out-Null
     if ($Platform -eq "yandexmicro") {
         $bootScript = @"
 #!/bin/sh
