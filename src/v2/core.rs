@@ -479,7 +479,14 @@ impl Manager {
                 self.profile.arch
             )
         }
-        self.validate_relations(&manifest)?;
+        let to_replace = self.plan_relations(&manifest)?;
+        if !to_replace.is_empty() && !yes {
+            bail!(
+                "{} would replace {}; rerun with --yes after reviewing the removal",
+                manifest.name,
+                to_replace.join(", ")
+            )
+        }
         if manifest
             .entware
             .as_ref()
@@ -497,6 +504,15 @@ impl Manager {
             let _ = fs::remove_dir_all(&staging);
         }
         result?;
+        // A4: now that the replacement is installed and owns whatever
+        // common-tree paths it claims, remove what it replaces. Skips
+        // remove_locked's own dependents check: check_replace_dependents
+        // (run as part of plan_relations, before any of this) already
+        // accounts for this manifest covering what it replaces.
+        for package in &to_replace {
+            self.remove_locked(package, false)
+                .with_context(|| format!("remove replaced package {package}"))?;
+        }
         Ok(manifest)
     }
 
@@ -842,39 +858,52 @@ impl Manager {
             bail!("a previous yam transaction did not finish; run `yam repair` before removing")
         }
         self.clear_stale_staging()?;
+        self.remove_locked(name, true)
+    }
+
+    /// Core of `remove`, callable while a transaction lock is already
+    /// held. `check_dependents` is false only when `install` removes a
+    /// package `replaces` covers: `plan_relations`/`check_replace_dependents`
+    /// already verified every dependent stays satisfied (directly or
+    /// through the manifest being installed), which this blunter,
+    /// capability-blind check cannot know about.
+    fn remove_locked(&mut self, name: &str, check_dependents: bool) -> Result<()> {
         validate_name(name)?;
         let (namespace, package) = split_name(name)?;
-        let capabilities = {
-            let mut statement = self
-                .db
-                .prepare("SELECT capability FROM provides WHERE package_name=?1")?;
-            let values = statement
-                .query_map([name], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<HashSet<_>>>()?;
-            values
-        };
-        let dependents = {
-            let mut statement = self.db.prepare(
-                "SELECT package_name,requirement FROM dependencies WHERE package_name != ?1",
-            )?;
-            let dependents = statement
-                .query_map([name], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .filter_map(Result::ok)
-                .filter(|(_, requirement)| {
-                    requirement_name(requirement)
-                        .is_ok_and(|required| required == name || capabilities.contains(required))
-                })
-                .map(|(package, _)| package)
-                .collect::<Vec<_>>();
-            dependents
-        };
-        if !dependents.is_empty() {
-            bail!(
-                "cannot remove {name}; required by {}",
-                dependents.join(", ")
-            )
+        if check_dependents {
+            let capabilities = {
+                let mut statement = self
+                    .db
+                    .prepare("SELECT capability FROM provides WHERE package_name=?1")?;
+                let values = statement
+                    .query_map([name], |row| row.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<HashSet<_>>>()?;
+                values
+            };
+            let dependents = {
+                let mut statement = self.db.prepare(
+                    "SELECT package_name,requirement FROM dependencies WHERE package_name != ?1",
+                )?;
+                let dependents = statement
+                    .query_map([name], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .filter_map(Result::ok)
+                    .filter(|(_, requirement)| {
+                        requirement_name(requirement).is_ok_and(|required| {
+                            required == name || capabilities.contains(required)
+                        })
+                    })
+                    .map(|(package, _)| package)
+                    .collect::<Vec<_>>();
+                dependents
+            };
+            if !dependents.is_empty() {
+                bail!(
+                    "cannot remove {name}; required by {}",
+                    dependents.join(", ")
+                )
+            }
         }
         self.db
             .query_row::<String, _, _>(
@@ -1249,10 +1278,11 @@ impl Manager {
         Ok(())
     }
 
-    fn validate_relations(&self, manifest: &PackageManifest) -> Result<()> {
-        if !manifest.replaces.is_empty() {
-            bail!("replaces is not implemented yet; refusing a partial install")
-        }
+    /// Validate `depends`/`conflicts`/`replaces` and return the full
+    /// names of installed packages that must be removed because this
+    /// install replaces them (A4). Does not touch the database or disk;
+    /// callers run this before any mutation.
+    fn plan_relations(&self, manifest: &PackageManifest) -> Result<Vec<String>> {
         for requirement in &manifest.depends {
             let (name, constraints) = parse_requirement(requirement)?;
             if !self.requirement_satisfied(name, &constraints)? {
@@ -1262,16 +1292,118 @@ impl Manager {
                 )
             }
         }
+        let mut to_replace: Vec<String> = Vec::new();
         for conflict in &manifest.conflicts {
             let (name, constraints) = parse_requirement(conflict)?;
-            if self.requirement_satisfied(name, &constraints)? && name != manifest.name {
+            // A package never conflicts with itself, whether named
+            // directly or reached through a virtual capability it
+            // provides (e.g. upgrading in place while conflicting with
+            // its own `provides`).
+            let matches: Vec<String> = self
+                .satisfying_packages(name, &constraints)?
+                .into_iter()
+                .filter(|package_name| package_name != &manifest.name)
+                .collect();
+            if matches.is_empty() {
+                continue;
+            }
+            let covering_replaces: Vec<&String> = manifest
+                .replaces
+                .iter()
+                .filter(|entry| {
+                    requirement_name(entry).is_ok_and(|replaced_name| replaced_name == name)
+                })
+                .collect();
+            if covering_replaces.is_empty() {
                 bail!(
                     "{} conflicts with installed package or capability {conflict}",
                     manifest.name
                 )
             }
+            for package_name in &matches {
+                let installed_version = self.installed_version(package_name)?;
+                let covered = covering_replaces.iter().any(|entry| {
+                    parse_requirement(entry)
+                        .is_ok_and(|(_, limits)| limits.matches(&installed_version))
+                });
+                if !covered {
+                    bail!(
+                        "{} conflicts with installed {package_name}, and replaces {conflict} \
+                         does not cover its installed version {installed_version}",
+                        manifest.name
+                    )
+                }
+                if !to_replace.contains(package_name) {
+                    to_replace.push(package_name.clone());
+                }
+            }
+        }
+        self.check_replace_dependents(&to_replace, manifest)?;
+        Ok(to_replace)
+    }
+
+    /// Refuse the replace if some other installed package still needs
+    /// one of `to_replace`: by its exact full name (always a hard
+    /// block), or by a virtual capability no other installed package
+    /// and no part of `manifest` itself would cover once they're gone.
+    fn check_replace_dependents(
+        &self,
+        to_replace: &[String],
+        manifest: &PackageManifest,
+    ) -> Result<()> {
+        if to_replace.is_empty() {
+            return Ok(());
+        }
+        let mut statement = self
+            .db
+            .prepare("SELECT package_name, requirement FROM dependencies")?;
+        let rows: Vec<(String, String)> = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut broken = Vec::new();
+        for (dependent, requirement) in rows {
+            if to_replace.contains(&dependent) || dependent == manifest.name {
+                continue;
+            }
+            let (required_name, required_constraints) = parse_requirement(&requirement)?;
+            if to_replace.iter().any(|replaced| replaced == required_name) {
+                broken.push(format!("{dependent} ({requirement})"));
+                continue;
+            }
+            let remaining_providers = self
+                .satisfying_packages(required_name, &required_constraints)?
+                .into_iter()
+                .any(|provider| !to_replace.contains(&provider));
+            if remaining_providers {
+                continue;
+            }
+            let new_version = version::parse_version(&manifest.version)?;
+            let new_covers = manifest.provides.iter().any(|p| p == required_name)
+                && required_constraints.matches(&new_version);
+            if !new_covers {
+                broken.push(format!("{dependent} ({requirement})"));
+            }
+        }
+        if !broken.is_empty() {
+            bail!(
+                "cannot replace {}; required by {}",
+                to_replace.join(", "),
+                broken.join(", ")
+            )
         }
         Ok(())
+    }
+
+    fn installed_version(&self, name: &str) -> Result<semver::Version> {
+        let version: String = self
+            .db
+            .query_row(
+                "SELECT version FROM packages WHERE name=?1",
+                [name],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("{name} is not installed"))?;
+        version::parse_version(&version)
     }
 
     fn requirement_satisfied(
@@ -1279,6 +1411,17 @@ impl Manager {
         name: &str,
         constraints: &version::Constraints,
     ) -> Result<bool> {
+        Ok(!self.satisfying_packages(name, constraints)?.is_empty())
+    }
+
+    /// Every installed package name that is itself called `name`, or
+    /// that provides the virtual capability `name`, whose installed
+    /// version matches `constraints`.
+    fn satisfying_packages(
+        &self,
+        name: &str,
+        constraints: &version::Constraints,
+    ) -> Result<Vec<String>> {
         let mut statement = self.db.prepare(
             "SELECT p.name,p.version FROM packages p WHERE p.name=?1
              UNION SELECT p.name,p.version FROM packages p JOIN provides v ON v.package_name=p.name WHERE v.capability=?1",
@@ -1288,13 +1431,14 @@ impl Manager {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        for (_, candidate_version) in candidates {
+        let mut matched = Vec::new();
+        for (package_name, candidate_version) in candidates {
             let candidate_version = version::parse_version(&candidate_version)?;
             if constraints.matches(&candidate_version) {
-                return Ok(true);
+                matched.push(package_name);
             }
         }
-        Ok(false)
+        Ok(matched)
     }
 }
 
