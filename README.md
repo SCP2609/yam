@@ -18,17 +18,16 @@ curl -fsSL https://hackalice.me/install.sh | sh
 irm https://hackalice.me/install.ps1 | iex
 ```
 
-Установщик подключается к колонке через ADB. Публикуется только `yam` для
-`aarch64-unknown-linux-musl`; десктопных сборок нет.
+Установщик подключается к колонке через ADB. Используйте yam через adb shell
 
 ## Использование
 
 ```sh
-yam --platform yandexmicro list
-yam --platform yandexmicro search namespace/package
-yam --platform yandexmicro install namespace/package
-yam --platform yandexmicro doctor
-yam --platform yandexmicro repair
+yam list
+yam search namespace/package
+yam install namespace/package
+yam doctor
+yam repair
 ```
 
 Для локальной проверки пакета укажите отдельный каталог:
@@ -43,4 +42,4 @@ yam --platform yandexmicro --root ./yam-root install --yes package.yampkg
 - [Реестр](docs/REGISTRY.md)
 
 Lua, Quasar, веб-интерфейс и старые `.yap`/`plugin.toml` находятся в отдельном
-пакете [`packages/yam-lua-runtime/`](packages/yam-lua-runtime/), а не в ядре YAM.
+пакете [`packages/yam-lua-runtime/`](packages/yam-lua-runtime/). В планах перевести runtime в отдельный репозиторий.
