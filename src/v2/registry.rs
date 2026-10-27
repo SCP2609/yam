@@ -12,6 +12,7 @@ use std::{
 use url::Url;
 
 use super::core::PlatformProfile;
+use super::version;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryConfig {
@@ -159,9 +160,10 @@ pub fn select_artifact(
         None => index
             .versions
             .keys()
-            .filter(|version| !version.contains('-'))
-            .max_by(|left, right| version_cmp(left, right))
-            .cloned()
+            .filter_map(|key| version::parse_version(key).ok().map(|parsed| (parsed, key)))
+            .filter(|(parsed, _)| parsed.pre.is_empty())
+            .max_by(|left, right| left.0.cmp(&right.0))
+            .map(|(_, key)| key.clone())
             .context("registry has no stable versions")?,
     };
     let metadata = index
@@ -288,58 +290,24 @@ fn split_requirement(value: &str) -> Result<(&str, Vec<&str>)> {
     }
     Ok((name, constraints))
 }
+/// Highest published version matching every constraint. A pre-release is
+/// only matched when a constraint pins to it explicitly at the same
+/// major.minor.patch (`version::Constraints`/`semver::VersionReq`'s own
+/// rule); no separate dash-based filter is needed or applied here.
 fn select_version(index: &PackageIndex, constraints: &[&str]) -> Result<String> {
+    let parsed = version::Constraints::parse(&constraints.join(" "))?;
     index
         .versions
         .keys()
-        .filter(|version| {
-            !version.contains('-')
-                && constraints
-                    .iter()
-                    .all(|constraint| version_matches(version, constraint))
+        .filter_map(|key| {
+            version::parse_version(key)
+                .ok()
+                .map(|version| (version, key))
         })
-        .max_by(|left, right| version_cmp(left, right))
-        .cloned()
+        .filter(|(version, _)| parsed.matches(version))
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, key)| key.clone())
         .context("no registry version satisfies dependency")
-}
-fn version_matches(version: &str, constraint: &str) -> bool {
-    let Some((operator, expected)) = [">=", "^", "~", "=", "<"].iter().find_map(|operator| {
-        constraint
-            .strip_prefix(operator)
-            .map(|expected| (*operator, expected))
-    }) else {
-        return false;
-    };
-    let compare = version_cmp(version, &normalize_version(expected));
-    match operator {
-        ">=" => compare.is_ge(),
-        "<" => compare.is_lt(),
-        "=" => compare.is_eq(),
-        "~" => compare.is_ge() && same_parts(version, expected, 2),
-        "^" => {
-            compare.is_ge()
-                && same_parts(
-                    version,
-                    expected,
-                    if expected.starts_with("0.") { 2 } else { 1 },
-                )
-        }
-        _ => false,
-    }
-}
-fn normalize_version(value: &str) -> String {
-    let mut parts = value.split('.').collect::<Vec<_>>();
-    while parts.len() < 3 {
-        parts.push("0");
-    }
-    parts.join(".")
-}
-fn same_parts(version: &str, expected: &str, count: usize) -> bool {
-    version
-        .split('.')
-        .zip(expected.split('.'))
-        .take(count)
-        .all(|(left, right)| left == right)
 }
 fn get_signed_json<T: for<'a> Deserialize<'a>>(registry: &Registry, path: &str) -> Result<T> {
     let base = Url::parse(&format!("{}/", registry.url.trim_end_matches('/')))?;
@@ -381,28 +349,6 @@ fn verify_signature(key: &str, body: &[u8], signature: &str) -> Result<()> {
     key.verify(body, &signature)
         .context("registry index signature verification failed")
 }
-fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
-    let parse = |value: &str| {
-        value
-            .split('.')
-            .map(|part| part.parse::<u64>().unwrap_or(0))
-            .collect::<Vec<_>>()
-    };
-    let (left, right) = (parse(left), parse(right));
-    for index in 0..left.len().max(right.len()) {
-        match left
-            .get(index)
-            .copied()
-            .unwrap_or(0)
-            .cmp(&right.get(index).copied().unwrap_or(0))
-        {
-            std::cmp::Ordering::Equal => {}
-            order => return order,
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
