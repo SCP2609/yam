@@ -2275,4 +2275,55 @@ mod tests {
             "a failed remove must leave the package exactly as installed, including every link"
         );
     }
+
+    #[test]
+    fn mutating_commands_refuse_to_run_after_an_interrupted_transaction() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/plug-tool", b"payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        // Simulate a crash: a transaction marker left behind because the
+        // process died before clearing it, as Manager::open would find
+        // on the next run.
+        let manager = Manager::open(root.clone(), profile).unwrap();
+        fs::write(root.join("db/transaction.json"), b"{}").unwrap();
+        drop(manager);
+
+        let mut reopened = Manager::open(root.clone(), test_profile(workdir.path())).unwrap();
+        let result = reopened.install(&artifact, true);
+        assert!(
+            result.is_err(),
+            "install must refuse to run while an interrupted transaction's marker is present"
+        );
+
+        reopened.repair().unwrap();
+        reopened
+            .install(&artifact, true)
+            .expect("install must work again once repair has cleared the interrupted marker");
+    }
+
+    #[test]
+    fn repair_cleans_up_stale_staging_directories() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+        let manager = Manager::open(root.clone(), profile).unwrap();
+
+        let stale = root.join(".staging").join("leftover-from-a-crash");
+        fs::create_dir_all(&stale).unwrap();
+        fs::write(stale.join("partial.bin"), b"partial").unwrap();
+
+        manager.repair().unwrap();
+
+        assert!(
+            !stale.exists(),
+            "repair must clear stale .staging/ directories left by an interrupted transaction"
+        );
+    }
 }
