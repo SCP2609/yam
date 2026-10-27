@@ -182,6 +182,10 @@ pub struct Manager {
     /// production surface.
     #[cfg(test)]
     fail_after_links: Option<u32>,
+    /// Test-only fault injection for `remove`'s rollback path: when set,
+    /// removing the Nth link fails instead of succeeding.
+    #[cfg(test)]
+    fail_after_link_removals: Option<u32>,
 }
 
 impl Manager {
@@ -235,6 +239,8 @@ impl Manager {
             db,
             #[cfg(test)]
             fail_after_links: None,
+            #[cfg(test)]
+            fail_after_link_removals: None,
         })
     }
 
@@ -250,6 +256,13 @@ impl Manager {
     #[cfg(test)]
     pub(crate) fn inject_link_failure_after(&mut self, count: u32) {
         self.fail_after_links = Some(count);
+    }
+
+    /// Test-only: make the Nth link `remove` removes fail, to exercise
+    /// its rollback path. See the `fail_after_link_removals` field.
+    #[cfg(test)]
+    pub(crate) fn inject_remove_failure_after(&mut self, count: u32) {
+        self.fail_after_link_removals = Some(count);
     }
 
     pub fn pack(source_dir: &Path, profile: &PlatformProfile, output: &Path) -> Result<()> {
@@ -774,12 +787,18 @@ impl Manager {
             links
         };
         let transaction = self.db.transaction()?;
+        let mut links_removed: u32 = 0;
         for (path, target) in &links {
             let link = self.root.join(path);
             if link.is_symlink() && fs::read_link(&link).ok().as_deref() == Some(Path::new(target))
             {
                 fs::remove_file(&link)
                     .with_context(|| format!("remove link {}", link.display()))?;
+                links_removed += 1;
+                #[cfg(test)]
+                if self.fail_after_link_removals == Some(links_removed) {
+                    bail!("injected test failure after removing {links_removed} links")
+                }
             }
         }
         transaction.execute("DELETE FROM packages WHERE name=?1", [name])?;
@@ -2196,6 +2215,37 @@ mod tests {
             fs::read(root.join("bin/plug-tool")).unwrap(),
             b"v1",
             "the old version's binary must still be the one served"
+        );
+    }
+
+    #[test]
+    fn remove_failure_mid_transaction_leaves_the_package_fully_installed() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/a-tool", b"a")
+            .file("bin/b-tool", b"b")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&artifact, true).unwrap();
+        let before = snapshot_root(&manager, &root);
+
+        manager.inject_remove_failure_after(1);
+        let result = manager.remove("vasya/plug");
+        assert!(
+            result.is_err(),
+            "the injected fault must propagate as an error"
+        );
+
+        let after = snapshot_root(&manager, &root);
+        assert_eq!(
+            before, after,
+            "a failed remove must leave the package exactly as installed, including every link"
         );
     }
 }
