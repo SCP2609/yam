@@ -428,16 +428,28 @@ impl Manager {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?;
-        if let Some((old_version, old_payload)) = existing {
-            if old_version == manifest.version {
+        if let Some((old_version, _)) = &existing {
+            if old_version == &manifest.version {
                 bail!(
                     "{} {} is already installed",
                     manifest.name,
                     manifest.version
                 )
             }
-            let _ = old_payload;
         }
+        // Links the previous version (if any) owns, captured before the
+        // upcoming DELETE so an upgrade can tell which ones the new
+        // version no longer wants and remove them from disk (A1).
+        let old_links: Vec<(String, String)> = {
+            let mut statement =
+                transaction.prepare("SELECT path, target FROM links WHERE package_name=?1")?;
+            let rows = statement
+                .query_map([&manifest.name], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            rows
+        };
         if destination.exists() {
             bail!(
                 "payload destination already exists: {}",
@@ -512,7 +524,42 @@ impl Manager {
                 )?;
             }
         }
+        // A1: remove links the previous version owned that the new
+        // version doesn't re-create, but only if the on-disk symlink
+        // still points exactly where the database says it does -- never
+        // touch a path something else has since taken over.
+        let new_paths: HashSet<&str> = manifest
+            .files_sha256
+            .keys()
+            .map(String::as_str)
+            .filter(|path| linkable(path))
+            .collect();
+        let mut removed_stale_links = Vec::new();
+        for (path, target) in &old_links {
+            if new_paths.contains(path.as_str()) {
+                continue;
+            }
+            let link = self.root.join(path);
+            if fs::read_link(&link).ok().as_deref() == Some(Path::new(target)) {
+                fs::remove_file(&link)
+                    .with_context(|| format!("remove stale link {}", link.display()))?;
+                removed_stale_links.push(link);
+            }
+        }
         transaction.commit()?;
+        for link in &removed_stale_links {
+            self.prune_empty_ancestors(link);
+        }
+        // A1: now that the database agrees the old version is gone,
+        // remove its payload directory too.
+        if let Some((old_version, _)) = &existing {
+            if old_version != &manifest.version {
+                let old_payload = package_root.join(old_version);
+                fs::remove_dir_all(&old_payload).with_context(|| {
+                    format!("remove old version directory {}", old_payload.display())
+                })?;
+            }
+        }
         let _ = fs::remove_dir_all(staging);
         Ok(())
     }
@@ -583,6 +630,7 @@ impl Manager {
 
     pub fn remove(&mut self, name: &str) -> Result<()> {
         validate_name(name)?;
+        let (namespace, package) = split_name(name)?;
         let capabilities = {
             let mut statement = self
                 .db
@@ -615,9 +663,8 @@ impl Manager {
                 dependents.join(", ")
             )
         }
-        let payload: String = self
-            .db
-            .query_row(
+        self.db
+            .query_row::<String, _, _>(
                 "SELECT payload_path FROM packages WHERE name=?1",
                 [name],
                 |row| row.get(0),
@@ -636,20 +683,64 @@ impl Manager {
             links
         };
         let transaction = self.db.transaction()?;
-        for (path, target) in links {
+        for (path, target) in &links {
             let link = self.root.join(path);
-            if link.is_symlink()
-                && fs::read_link(&link)
-                    .ok()
-                    .is_some_and(|value| value == PathBuf::from(&target))
+            if link.is_symlink() && fs::read_link(&link).ok().as_deref() == Some(Path::new(target))
             {
-                fs::remove_file(link)?;
+                fs::remove_file(&link)
+                    .with_context(|| format!("remove link {}", link.display()))?;
             }
         }
         transaction.execute("DELETE FROM packages WHERE name=?1", [name])?;
         transaction.commit()?;
-        fs::remove_dir_all(payload)?;
+        // A1: prune common-tree directories left empty by the links just
+        // removed, then delete every version directory (not just the
+        // current one) plus `current` itself, and the namespace
+        // directory too if it is now empty.
+        for (path, _) in &links {
+            self.prune_empty_ancestors(&self.root.join(path));
+        }
+        let package_root = self.root.join("pkgs").join(namespace).join(package);
+        fs::remove_dir_all(&package_root)
+            .with_context(|| format!("remove package directory {}", package_root.display()))?;
+        let namespace_root = self.root.join("pkgs").join(namespace);
+        if fs::read_dir(&namespace_root)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_dir(&namespace_root);
+        }
         Ok(())
+    }
+
+    /// Remove `link`'s parent directory, then its parent, and so on,
+    /// stopping as soon as a directory is non-empty or would be `bin/`
+    /// or `share/` itself. Used after removing a link so a package's own
+    /// now-empty subdirectory (e.g. `share/lua-runtime/plugins/vasya.plug/`)
+    /// doesn't linger forever; never removes a directory with anything
+    /// left in it, owned by YAM or not.
+    fn prune_empty_ancestors(&self, link: &Path) {
+        let mut current = link.parent().map(Path::to_path_buf);
+        while let Some(dir) = current {
+            let Ok(relative) = dir.strip_prefix(&self.root) else {
+                break;
+            };
+            if relative == Path::new("bin") || relative == Path::new("share") {
+                break;
+            }
+            match fs::read_dir(&dir) {
+                Ok(mut entries) => {
+                    if entries.next().is_some() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+            if fs::remove_dir(&dir).is_err() {
+                break;
+            }
+            current = dir.parent().map(Path::to_path_buf);
+        }
     }
 
     pub fn doctor(&self) -> Result<Vec<String>> {
