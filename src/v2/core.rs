@@ -174,6 +174,14 @@ pub struct Manager {
     root: PathBuf,
     profile: PlatformProfile,
     db: Connection,
+    /// Test-only fault injection for B1's rollback path: when set, the
+    /// Nth link created during `install_payload` fails instead of
+    /// succeeding, so a test can assert the disk and database end up
+    /// exactly as they were before the call. Never present in a release
+    /// build; never settable from an environment variable or any other
+    /// production surface.
+    #[cfg(test)]
+    fail_after_links: Option<u32>,
 }
 
 impl Manager {
@@ -221,7 +229,13 @@ impl Manager {
                 PRIMARY KEY(package_name, name)
               );",
         )?;
-        Ok(Self { root, profile, db })
+        Ok(Self {
+            root,
+            profile,
+            db,
+            #[cfg(test)]
+            fail_after_links: None,
+        })
     }
 
     pub fn profile(&self) -> &PlatformProfile {
@@ -229,6 +243,13 @@ impl Manager {
     }
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Test-only: make the Nth link `install_payload` creates fail, to
+    /// exercise the rollback path. See the `fail_after_links` field.
+    #[cfg(test)]
+    pub(crate) fn inject_link_failure_after(&mut self, count: u32) {
+        self.fail_after_links = Some(count);
     }
 
     pub fn pack(source_dir: &Path, profile: &PlatformProfile, output: &Path) -> Result<()> {
@@ -503,6 +524,7 @@ impl Manager {
             )?;
         }
         transaction.execute("DELETE FROM links WHERE package_name=?1", [&manifest.name])?;
+        let mut links_created: u32 = 0;
         for (path, hash) in &manifest.files_sha256 {
             transaction.execute(
                 "INSERT INTO package_files(package_name,path,sha256) VALUES(?1,?2,?3)",
@@ -522,6 +544,11 @@ impl Manager {
                     "INSERT OR REPLACE INTO links(path,package_name,target) VALUES(?1,?2,?3)",
                     params![path, manifest.name, target.to_string_lossy()],
                 )?;
+                links_created += 1;
+                #[cfg(test)]
+                if self.fail_after_links == Some(links_created) {
+                    bail!("injected test failure after creating {links_created} links")
+                }
             }
         }
         // A1: remove links the previous version owned that the new
@@ -1493,6 +1520,55 @@ mod tests {
         Ok(())
     }
 
+    /// Everything a test should care about having changed or not: every
+    /// installed package's recorded files (via the public API), plus the
+    /// whole file tree under `root` (symlink targets, directories, and
+    /// regular file contents by hash), excluding `db/` (its raw bytes
+    /// legitimately differ run to run even with identical logical state)
+    /// and `.staging/` (scratch space). Used by B1 tests to assert a
+    /// failed transaction left absolutely nothing behind.
+    #[derive(Debug, PartialEq, Eq)]
+    struct RootSnapshot {
+        packages: Vec<(String, String, Vec<String>)>,
+        tree: BTreeMap<String, String>,
+    }
+    fn snapshot_root(manager: &Manager, root: &Path) -> RootSnapshot {
+        let packages = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|package| {
+                let files = manager.files(&package.name).unwrap();
+                (package.name, package.version, files)
+            })
+            .collect();
+        let mut tree = BTreeMap::new();
+        for entry in walkdir::WalkDir::new(root) {
+            let entry = entry.unwrap();
+            if entry.path() == root {
+                continue;
+            }
+            let relative = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            if relative == "db" || relative.starts_with("db/") || relative == ".staging" {
+                continue;
+            }
+            let kind = if entry.file_type().is_symlink() {
+                format!("symlink:{}", fs::read_link(entry.path()).unwrap().display())
+            } else if entry.file_type().is_dir() {
+                "dir".to_string()
+            } else {
+                format!("file:{}", digest_file(entry.path()).unwrap())
+            };
+            tree.insert(relative, kind);
+        }
+        RootSnapshot { packages, tree }
+    }
+
     #[test]
     fn install_refuses_to_overwrite_a_foreign_regular_file() {
         let workdir = TempDir::new().unwrap();
@@ -1908,6 +1984,83 @@ mod tests {
         assert!(
             problems.iter().any(|p| p.contains("vasya/plug")),
             "doctor must report a package whose payload directory is gone, got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn install_failure_mid_transaction_leaves_everything_unchanged() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/a-tool", b"a")
+            .file("bin/b-tool", b"b")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        let before = snapshot_root(&manager, &root);
+
+        manager.inject_link_failure_after(1);
+        let result = manager.install(&artifact, true);
+        assert!(
+            result.is_err(),
+            "the injected fault must propagate as an error"
+        );
+
+        let after = snapshot_root(&manager, &root);
+        assert_eq!(
+            before, after,
+            "disk and database must be exactly as they were before a failed install"
+        );
+
+        drop(manager);
+        let mut retry = Manager::open(root.clone(), test_profile(workdir.path())).unwrap();
+        retry
+            .install(&artifact, true)
+            .expect("installing the same package again after a rolled-back failure must succeed");
+    }
+
+    #[test]
+    fn upgrade_failure_mid_transaction_keeps_the_old_version_active() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let v1 = workdir.path().join("v1.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/plug-tool", b"v1")
+            .pack(&workdir.path().join("src-1"), &profile, &v1)
+            .unwrap();
+        let v2 = workdir.path().join("v2.yampkg");
+        TestPackage::new("vasya/plug", "1.1.0")
+            .file("bin/plug-tool", b"v2")
+            .file("bin/extra-tool", b"extra")
+            .pack(&workdir.path().join("src-2"), &profile, &v2)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&v1, true).unwrap();
+        let before = snapshot_root(&manager, &root);
+
+        manager.inject_link_failure_after(1);
+        let result = manager.install(&v2, true);
+        assert!(
+            result.is_err(),
+            "the injected fault must propagate as an error"
+        );
+
+        let after = snapshot_root(&manager, &root);
+        assert_eq!(
+            before, after,
+            "a failed upgrade must leave the old version's disk and database state untouched"
+        );
+        assert_eq!(
+            fs::read(root.join("bin/plug-tool")).unwrap(),
+            b"v1",
+            "the old version's binary must still be the one served"
         );
     }
 }
