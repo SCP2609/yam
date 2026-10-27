@@ -1,0 +1,8 @@
+id: saturn
+arch: aarch64
+triple: aarch64-unknown-linux-musl
+paths:
+  root: /data/yam
+  etc: /data/yam/etc
+  var: /data/yam/var
+  run: /tmp/yam

@@ -1,0 +1,8 @@
+id: jbl_link_music
+arch: armv7
+triple: armv7-unknown-linux-musleabihf
+paths:
+  root: /data/yam
+  etc: /data/yam/etc
+  var: /data/yam/var
+  run: /tmp/yam

@@ -8,6 +8,9 @@ param(
 $ErrorActionPreference = "Stop"
 $repository = "https://github.com/nyakokitsu/yam"
 $deviceRoot = if ($env:YAM_ROOT) { $env:YAM_ROOT } else { "/data/yam" }
+if ($Platform -in @("mango", "jbl_link_music")) {
+    throw "Профиль $Platform использует 32-битный ARM; установщик публикует только aarch64 yam."
+}
 if ($Version -eq "latest") {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100" | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -like "yam-v*" } | Select-Object -First 1
     if (-not $release) { throw "Не найден релиз канала yam-v." }
@@ -76,7 +79,7 @@ rm -rf "$legacy"
 
     & adb -s $serial shell "mkdir -p '$deviceRoot/bin' '$deviceRoot/platforms'" | Out-Null
     & adb -s $serial push $binary "$deviceRoot/bin/yam.new" | Out-Null
-    foreach ($profile in @("yandexmicro", "yandexmini_2", "yandexmidi", "yandexplum")) {
+    foreach ($profile in @("yandexmicro", "plum", "yandexplum", "yandexmini", "yandexmini_2", "bergamot", "pickle", "cucumber", "yandexmidi", "mango", "yandexstation_2", "yandexstation", "saturn", "jbl_link_music", "orion")) {
         $profileFile = Join-Path $tmp "$profile.yaml"
         Invoke-WebRequest -Uri "$repository/raw/$sourceRef/platforms/$profile.yaml" -OutFile $profileFile
         & adb -s $serial push $profileFile "$deviceRoot/platforms/$profile.yaml" | Out-Null

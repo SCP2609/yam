@@ -25,6 +25,13 @@ if [ "$REMOVE_OLD" -eq 1 ] && [ "$DEVICE_ROOT" = /data/quazar/yam ]; then
   exit 2
 fi
 
+case "$PLATFORM" in
+  mango|jbl_link_music)
+    echo "Профиль $PLATFORM использует 32-битный ARM; установщик публикует только aarch64 yam." >&2
+    exit 3
+    ;;
+esac
+
 TMPDIR_INSTALL=$(mktemp -d "${TMPDIR:-/tmp}/yam.XXXXXX")
 trap 'rm -rf "$TMPDIR_INSTALL"' EXIT HUP INT TERM
 
@@ -121,7 +128,7 @@ verify "$TMPDIR_INSTALL/$ASSET"
 
 adb -s "$DEVICE" shell "mkdir -p '$DEVICE_ROOT/bin' '$DEVICE_ROOT/platforms'" </dev/null
 adb -s "$DEVICE" push "$TMPDIR_INSTALL/$ASSET" "$DEVICE_ROOT/bin/yam.new" </dev/null >/dev/null
-for profile in yandexmicro yandexmini_2 yandexmidi yandexplum; do
+for profile in yandexmicro plum yandexplum yandexmini yandexmini_2 bergamot pickle cucumber yandexmidi mango yandexstation_2 yandexstation saturn jbl_link_music orion; do
   download "$REPOSITORY/raw/$SOURCE_REF/platforms/$profile.yaml" "$TMPDIR_INSTALL/$profile.yaml"
   adb -s "$DEVICE" push "$TMPDIR_INSTALL/$profile.yaml" "$DEVICE_ROOT/platforms/$profile.yaml" </dev/null >/dev/null
 done
@@ -161,4 +168,4 @@ else
 fi
 
 echo "YAM установлен на $DEVICE: $DEVICE_ROOT/bin/yam"
-echo "Пример: adb -s $DEVICE shell 'yam --platform $PLATFORM --profiles $DEVICE_ROOT/platforms list'"
+echo "Пример: adb -s $DEVICE shell 'yam list'"
