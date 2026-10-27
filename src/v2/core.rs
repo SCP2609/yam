@@ -1382,4 +1382,37 @@ mod tests {
         );
         assert!(manager.list().unwrap().is_empty());
     }
+
+    #[test]
+    fn repair_refuses_to_replace_a_symlink_pointing_outside_its_own_package() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/plug-tool", b"yam payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let root = profile.paths.root.clone();
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&artifact, true).unwrap();
+
+        let link = root.join("bin/plug-tool");
+        let foreign_target = workdir.path().join("foreign-binary");
+        fs::write(&foreign_target, b"not yam's payload").unwrap();
+        fs::remove_file(&link).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&foreign_target, &link).unwrap();
+
+        let result = manager.repair();
+        assert!(
+            result.is_err(),
+            "repair must refuse to replace a foreign symlink, got: {result:?}"
+        );
+        assert_eq!(
+            fs::read_link(&link).unwrap(),
+            foreign_target,
+            "the foreign symlink must be left untouched"
+        );
+    }
 }
