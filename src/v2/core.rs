@@ -480,9 +480,12 @@ impl Manager {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(files_dir, &destination)?;
-        let package_root = destination.parent().context("package root")?;
-        replace_link(&package_root.join("current"), Path::new(&manifest.version))?;
+        let package_root = destination.parent().context("package root")?.to_path_buf();
+
+        // Every metadata write below lives in `transaction`, which is
+        // never committed unless the disk phase that follows succeeds
+        // completely; dropping it without committing rolls all of this
+        // back automatically (B1).
         transaction.execute(
             "DELETE FROM package_files WHERE package_name=?1",
             [&manifest.name],
@@ -524,58 +527,119 @@ impl Manager {
             )?;
         }
         transaction.execute("DELETE FROM links WHERE package_name=?1", [&manifest.name])?;
-        let mut links_created: u32 = 0;
         for (path, hash) in &manifest.files_sha256 {
             transaction.execute(
                 "INSERT INTO package_files(package_name,path,sha256) VALUES(?1,?2,?3)",
                 params![manifest.name, path, hash],
             )?;
             if linkable(path) {
-                let link = self.root.join(path);
-                if let Some(parent) = link.parent() {
-                    fs::create_dir_all(parent)?;
-                }
                 let target = destination.join(path);
-                if link.exists() || link.is_symlink() {
-                    fs::remove_file(&link)?;
-                }
-                make_link(&link, &target)?;
                 transaction.execute(
                     "INSERT OR REPLACE INTO links(path,package_name,target) VALUES(?1,?2,?3)",
                     params![path, manifest.name, target.to_string_lossy()],
                 )?;
-                links_created += 1;
-                #[cfg(test)]
-                if self.fail_after_links == Some(links_created) {
-                    bail!("injected test failure after creating {links_created} links")
-                }
             }
         }
-        // A1: remove links the previous version owned that the new
-        // version doesn't re-create, but only if the on-disk symlink
-        // still points exactly where the database says it does -- never
-        // touch a path something else has since taken over.
+
+        // Disk phase: every step is recorded so a failure partway
+        // through can be undone in reverse, leaving the disk exactly as
+        // it was before this call (B1).
         let new_paths: HashSet<&str> = manifest
             .files_sha256
             .keys()
             .map(String::as_str)
             .filter(|path| linkable(path))
             .collect();
-        let mut removed_stale_links = Vec::new();
-        for (path, target) in &old_links {
-            if new_paths.contains(path.as_str()) {
-                continue;
+        let mut undo: Vec<Undo> = Vec::new();
+        let mut removed_stale_links: Vec<PathBuf> = Vec::new();
+        let mut links_created: u32 = 0;
+        let disk_result: Result<()> = (|| {
+            fs::rename(&files_dir, &destination)?;
+            undo.push(Undo::RemoveDirAll(destination.clone()));
+
+            let current_link = package_root.join("current");
+            let previous_current = fs::read_link(&current_link).ok();
+            replace_link(&current_link, Path::new(&manifest.version))?;
+            undo.push(match previous_current {
+                Some(previous) => Undo::RestoreSymlink {
+                    path: current_link.clone(),
+                    target: previous,
+                },
+                None => Undo::RemoveSymlinkFile(current_link.clone()),
+            });
+
+            for path in manifest.files_sha256.keys().filter(|path| linkable(path)) {
+                let link = self.root.join(path);
+                if let Some(parent) = link.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let target = destination.join(path);
+                let previous_target = fs::read_link(&link).ok();
+                if link.exists() || link.is_symlink() {
+                    fs::remove_file(&link)?;
+                }
+                make_link(&link, &target)?;
+                undo.push(match previous_target {
+                    Some(previous) => Undo::RestoreSymlink {
+                        path: link.clone(),
+                        target: previous,
+                    },
+                    None => Undo::RemoveSymlinkFile(link.clone()),
+                });
+                links_created += 1;
+                #[cfg(test)]
+                if self.fail_after_links == Some(links_created) {
+                    bail!("injected test failure after creating {links_created} links")
+                }
             }
-            let link = self.root.join(path);
-            if fs::read_link(&link).ok().as_deref() == Some(Path::new(target)) {
-                fs::remove_file(&link)
-                    .with_context(|| format!("remove stale link {}", link.display()))?;
-                removed_stale_links.push(link);
+
+            // A1: remove links the previous version owned that the new
+            // version doesn't re-create, but only if the on-disk symlink
+            // still points exactly where the database says it does --
+            // never touch a path something else has since taken over.
+            for (path, target) in &old_links {
+                if new_paths.contains(path.as_str()) {
+                    continue;
+                }
+                let link = self.root.join(path);
+                if fs::read_link(&link).ok().as_deref() == Some(Path::new(target)) {
+                    fs::remove_file(&link)
+                        .with_context(|| format!("remove stale link {}", link.display()))?;
+                    undo.push(Undo::RestoreSymlink {
+                        path: link.clone(),
+                        target: PathBuf::from(target),
+                    });
+                    removed_stale_links.push(link);
+                }
             }
+            Ok(())
+        })();
+
+        if let Err(error) = disk_result {
+            let rollback_errors = unwind(undo);
+            // Dropping `transaction` without committing rolls back every
+            // database write above; drop it explicitly here so the
+            // pruning call below can borrow `self` again.
+            drop(transaction);
+            // `create_dir_all(destination.parent())` above may have made
+            // pkgs/<namespace>/<name> (and pkgs/<namespace>) from nothing;
+            // Undo::RemoveDirAll only removed `destination` itself, so
+            // clean those up too, stopping at pkgs/ itself.
+            self.prune_empty_ancestors(&destination, &self.root.join("pkgs"));
+            return Err(if rollback_errors.is_empty() {
+                error
+            } else {
+                error.context(format!(
+                    "disk rollback left problems behind, run `yam repair`: {}",
+                    rollback_errors.join("; ")
+                ))
+            });
         }
+
         transaction.commit()?;
         for link in &removed_stale_links {
-            self.prune_empty_ancestors(link);
+            let floor = self.common_tree_floor(link);
+            self.prune_empty_ancestors(link, &floor);
         }
         // A1: now that the database agrees the old version is gone,
         // remove its payload directory too.
@@ -725,7 +789,9 @@ impl Manager {
         // current one) plus `current` itself, and the namespace
         // directory too if it is now empty.
         for (path, _) in &links {
-            self.prune_empty_ancestors(&self.root.join(path));
+            let link = self.root.join(path);
+            let floor = self.common_tree_floor(&link);
+            self.prune_empty_ancestors(&link, &floor);
         }
         let package_root = self.root.join("pkgs").join(namespace).join(package);
         fs::remove_dir_all(&package_root)
@@ -740,19 +806,18 @@ impl Manager {
         Ok(())
     }
 
-    /// Remove `link`'s parent directory, then its parent, and so on,
-    /// stopping as soon as a directory is non-empty or would be `bin/`
-    /// or `share/` itself. Used after removing a link so a package's own
-    /// now-empty subdirectory (e.g. `share/lua-runtime/plugins/vasya.plug/`)
-    /// doesn't linger forever; never removes a directory with anything
-    /// left in it, owned by YAM or not.
-    fn prune_empty_ancestors(&self, link: &Path) {
-        let mut current = link.parent().map(Path::to_path_buf);
+    /// Remove `start`'s parent directory, then its parent, and so on,
+    /// stopping as soon as a directory is non-empty or equals `floor`.
+    /// Used after removing a link, or after rolling back a directory
+    /// `create_dir_all` made room for, so an now-empty ancestor (e.g. a
+    /// package's own `share/lua-runtime/plugins/vasya.plug/`, or
+    /// `pkgs/vasya/plug` once its only version directory is gone) doesn't
+    /// linger forever. Never removes a directory with anything left in
+    /// it, owned by YAM or not, and never removes `floor` itself.
+    fn prune_empty_ancestors(&self, start: &Path, floor: &Path) {
+        let mut current = start.parent().map(Path::to_path_buf);
         while let Some(dir) = current {
-            let Ok(relative) = dir.strip_prefix(&self.root) else {
-                break;
-            };
-            if relative == Path::new("bin") || relative == Path::new("share") {
+            if dir == floor || !dir.starts_with(&self.root) {
                 break;
             }
             match fs::read_dir(&dir) {
@@ -767,6 +832,20 @@ impl Manager {
                 break;
             }
             current = dir.parent().map(Path::to_path_buf);
+        }
+    }
+
+    /// The `bin/` or `share/` floor a common-tree link path belongs to,
+    /// for `prune_empty_ancestors`.
+    fn common_tree_floor(&self, path: &Path) -> PathBuf {
+        match path.strip_prefix(&self.root).ok().and_then(|relative| {
+            relative
+                .components()
+                .next()
+                .map(|component| component.as_os_str())
+        }) {
+            Some(top) => self.root.join(top),
+            None => self.root.clone(),
         }
     }
 
@@ -1322,6 +1401,62 @@ fn describe_obstruction(path: &Path) -> String {
 }
 fn linkable(path: &str) -> bool {
     path.starts_with("bin/") || path.starts_with("share/")
+}
+
+/// One already-applied disk change from `install_payload`'s disk phase,
+/// recorded so it can be undone in reverse if a later step in that same
+/// phase fails (B1). Database writes need no equivalent: they live in an
+/// uncommitted `rusqlite::Transaction` that rolls back on drop.
+enum Undo {
+    /// A directory `install_payload` created from nothing (the new
+    /// version's payload directory): delete it entirely.
+    RemoveDirAll(PathBuf),
+    /// A symlink that replaced an existing one: put the old target back.
+    RestoreSymlink { path: PathBuf, target: PathBuf },
+    /// A symlink created where nothing existed before: remove it.
+    RemoveSymlinkFile(PathBuf),
+}
+impl Undo {
+    fn apply(self) -> std::result::Result<(), String> {
+        match self {
+            Undo::RemoveDirAll(path) => fs::remove_dir_all(&path)
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| format!("remove {}: {error}", path.display())),
+            Undo::RemoveSymlinkFile(path) => fs::remove_file(&path)
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| format!("remove {}: {error}", path.display())),
+            Undo::RestoreSymlink { path, target } => {
+                if path.is_symlink() || path.exists() {
+                    let _ = fs::remove_file(&path);
+                }
+                make_link(&path, &target)
+                    .map_err(|error| format!("restore {}: {error}", path.display()))
+            }
+        }
+    }
+}
+/// Undo every recorded disk change, most recent first, continuing past
+/// individual failures so a single stuck step doesn't leave the rest of
+/// the rollback undone. Returns a description of each step that failed
+/// to undo (empty if the disk is back to exactly how it was).
+fn unwind(actions: Vec<Undo>) -> Vec<String> {
+    actions
+        .into_iter()
+        .rev()
+        .filter_map(|action| action.apply().err())
+        .collect()
 }
 fn append_bytes<W: Write>(archive: &mut Builder<W>, path: &str, bytes: &[u8]) -> Result<()> {
     let mut header = Header::new_gnu();
