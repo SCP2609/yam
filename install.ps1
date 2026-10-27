@@ -1,16 +1,13 @@
 param(
     [string]$Version = $(if ($env:YAM_VERSION) { $env:YAM_VERSION } else { "latest" }),
     [string]$StationIp,
-    [string]$Platform = $(if ($env:YAM_PLATFORM) { $env:YAM_PLATFORM } else { "yandexmicro" }),
+    [string]$Platform = $env:YAM_PLATFORM,
     [switch]$RemoveOld
 )
 
 $ErrorActionPreference = "Stop"
 $repository = "https://github.com/nyakokitsu/yam"
 $deviceRoot = if ($env:YAM_ROOT) { $env:YAM_ROOT } else { "/data/yam" }
-if ($Platform -in @("mango", "jbl_link_music")) {
-    throw "Профиль $Platform использует 32-битный ARM; установщик публикует только aarch64 yam."
-}
 if ($Version -eq "latest") {
     $release = Invoke-RestMethod -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100" | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -like "yam-v*" } | Select-Object -First 1
     if (-not $release) { throw "Не найден релиз канала yam-v." }
@@ -46,10 +43,38 @@ function Get-Device {
     return $serial
 }
 
+function Get-DetectedPlatform([string]$Serial) {
+    $identity = (& adb -s $Serial shell 'getprop ro.product.model; getprop ro.product.device; cat /proc/device-tree/compatible 2>/dev/null | tr "\000" "\n"' 2>$null | ForEach-Object { $_.Trim().ToLowerInvariant() }) -join "`n"
+    $platform = if ($identity -match 'yandex,station-mini2|station-mini2') { "yandexmini_2" }
+    elseif ($identity -match 'yandex,cucumber-dvt2|cucumber') { "cucumber" }
+    elseif ($identity -match 'yandex,station-midi') { "yandexmidi" }
+    elseif ($identity -match 'yandex,orion-pvt|orion') { "orion" }
+    elseif ($identity -match 'yandex,pickle-evt|pickle') { "pickle" }
+    elseif ($identity -match 'yandex,station-mini3|bergamot') { "bergamot" }
+    elseif ($identity -match 'yandex,saturn|saturn') { "saturn" }
+    elseif ($identity -match 'tulip-d1|tulip') { "yandexstation" }
+    elseif ($identity -match 'yandexstation_2|station-max') { "yandexstation_2" }
+    elseif ($identity -match 'mediatek,mt8167|jbl.*link.*music') { "jbl_link_music" }
+    elseif ($identity -match 'mango') { "mango" }
+    elseif ($identity -match 'plum') { "plum" }
+    elseif ($identity -match 'yandex.*station.*micro|yandexmicro') { "yandexmicro" }
+    elseif ($identity -match 'amlogic,axg') { "yandexmini" }
+    else { $null }
+    if (-not $platform) { throw "Не удалось определить платформу колонки. Задайте -Platform явно.`n$identity" }
+    return $platform
+}
+
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("yam-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     $serial = Get-Device
+    if ([string]::IsNullOrWhiteSpace($Platform)) {
+        $Platform = Get-DetectedPlatform $serial
+        Write-Host "Определена платформа: $Platform"
+    }
+    if ($Platform -in @("mango", "jbl_link_music")) {
+        throw "Профиль $Platform использует 32-битный ARM; установщик публикует только aarch64 yam."
+    }
     if ($RemoveOld) {
         if ($deviceRoot -eq "/data/quazar/yam") { throw "YAM_ROOT не может указывать на legacy-каталог с -RemoveOld." }
         $legacyCleanup = @'

@@ -18,7 +18,7 @@ while [ "$#" -gt 0 ]; do
 done
 REPOSITORY=https://github.com/nyakokitsu/yam
 DEVICE_ROOT=${YAM_ROOT:-/data/yam}
-PLATFORM=${YAM_PLATFORM:-yandexmicro}
+PLATFORM=${YAM_PLATFORM:-}
 
 if [ "$REMOVE_OLD" -eq 1 ] && [ "$DEVICE_ROOT" = /data/quazar/yam ]; then
   echo 'YAM_ROOT не может указывать на legacy-каталог при --remove-old.' >&2
@@ -95,6 +95,31 @@ choose_device() {
   printf '%s\n' "$devices" | sed -n "${selection}p"
 }
 
+device_identity() {
+  adb -s "$DEVICE" shell 'getprop ro.product.model; getprop ro.product.device; cat /proc/device-tree/compatible 2>/dev/null | tr "\000" "\n"' </dev/null 2>/dev/null \
+    | tr -d '\r' | tr '[:upper:]' '[:lower:]'
+}
+
+detect_platform() {
+  case "$DEVICE_IDENTITY" in
+    *yandex,station-mini2*|*station-mini2*) printf '%s\n' yandexmini_2 ;;
+    *yandex,cucumber-dvt2*|*cucumber*) printf '%s\n' cucumber ;;
+    *yandex,station-midi*) printf '%s\n' yandexmidi ;;
+    *yandex,orion-pvt*|*orion*) printf '%s\n' orion ;;
+    *yandex,pickle-evt*|*pickle*) printf '%s\n' pickle ;;
+    *yandex,station-mini3*|*bergamot*) printf '%s\n' bergamot ;;
+    *yandex,saturn*|*saturn*) printf '%s\n' saturn ;;
+    *tulip-d1*|*tulip*) printf '%s\n' yandexstation ;;
+    *yandexstation_2*|*station-max*) printf '%s\n' yandexstation_2 ;;
+    *mediatek,mt8167*|*jbl*link*music*) printf '%s\n' jbl_link_music ;;
+    *mango*) printf '%s\n' mango ;;
+    *plum*) printf '%s\n' plum ;;
+    *yandex*station*micro*|*yandexmicro*) printf '%s\n' yandexmicro ;;
+    *amlogic,axg*) printf '%s\n' yandexmini ;;
+    *) return 1 ;;
+  esac
+}
+
 DEVICE=$(choose_device || true)
 if [ -z "$DEVICE" ]; then
   printf 'IP-адрес колонки: ' >&2
@@ -103,6 +128,17 @@ if [ -z "$DEVICE" ]; then
   DEVICE="$ip:5555"
   adb connect "$DEVICE" </dev/null >&2
   adb -s "$DEVICE" get-state </dev/null >/dev/null
+fi
+
+if [ -z "$PLATFORM" ]; then
+  DEVICE_IDENTITY=$(device_identity)
+  PLATFORM=$(detect_platform || true)
+  if [ -z "$PLATFORM" ]; then
+    echo 'Не удалось определить платформу колонки. Задайте YAM_PLATFORM явно.' >&2
+    printf '%s\n' "$DEVICE_IDENTITY" >&2
+    exit 3
+  fi
+  echo "Определена платформа: $PLATFORM" >&2
 fi
 
 if [ "$REMOVE_OLD" -eq 1 ]; then

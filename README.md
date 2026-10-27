@@ -19,7 +19,12 @@ irm https://hackalice.me/install.ps1 | iex
 ```
 
 Установщик подключается к колонке через ADB. Публикуется только `yam` для
-`aarch64-unknown-linux-musl`; десктопных сборок нет.
+`aarch64-unknown-linux-musl`; десктопных сборок нет. Платформа определяется по
+модели и Device Tree. При необходимости её можно задать явно:
+
+```sh
+curl -fsSL https://hackalice.me/install.sh | YAM_PLATFORM=yandexmini_2 sh
+```
 
 ## Использование
 
