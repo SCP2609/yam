@@ -174,6 +174,11 @@ pub struct Manager {
     root: PathBuf,
     profile: PlatformProfile,
     db: Connection,
+    /// Set when `db/transaction.json` exists at open time: a previous
+    /// mutating command was interrupted (most likely killed) before it
+    /// could finish its rollback or its cleanup. Mutating commands
+    /// refuse to run until `repair` clears it.
+    interrupted: bool,
     /// Test-only fault injection for B1's rollback path: when set, the
     /// Nth link created during `install_payload` fails instead of
     /// succeeding, so a test can assert the disk and database end up
@@ -233,15 +238,31 @@ impl Manager {
                 PRIMARY KEY(package_name, name)
               );",
         )?;
+        let interrupted = root.join("db/transaction.json").is_file();
         Ok(Self {
             root,
             profile,
             db,
+            interrupted,
             #[cfg(test)]
             fail_after_links: None,
             #[cfg(test)]
             fail_after_link_removals: None,
         })
+    }
+
+    fn transaction_marker_path(&self) -> PathBuf {
+        self.root.join("db/transaction.json")
+    }
+
+    /// Remove every leftover directory under `.staging/`: scratch space
+    /// for an in-progress install, safe to clear at the start of any
+    /// mutating command.
+    fn clear_stale_staging(&self) -> Result<()> {
+        for entry in fs::read_dir(self.root.join(".staging"))? {
+            fs::remove_dir_all(entry?.path())?;
+        }
+        Ok(())
     }
 
     pub fn profile(&self) -> &PlatformProfile {
@@ -364,6 +385,10 @@ impl Manager {
     }
 
     pub fn install(&mut self, artifact: &Path, yes: bool) -> Result<PackageManifest> {
+        if self.interrupted {
+            bail!("a previous yam transaction did not finish; run `yam repair` before installing")
+        }
+        self.clear_stale_staging()?;
         let (manifest, payload) = read_artifact(artifact)?;
         validate_manifest(&manifest)?;
         if manifest.target != "any" && manifest.target != self.profile.id {
@@ -454,6 +479,7 @@ impl Manager {
             fs::write(&out, bytes)?;
             set_payload_mode(&out, path)?;
         }
+        let marker = self.transaction_marker_path();
         let transaction = self.db.transaction()?;
         let existing: Option<(String, String)> = transaction
             .query_row(
@@ -566,6 +592,16 @@ impl Manager {
         let mut undo: Vec<Undo> = Vec::new();
         let mut removed_stale_links: Vec<PathBuf> = Vec::new();
         let mut links_created: u32 = 0;
+        // Recorded before the first disk write so a crash partway
+        // through is visible to the next `Manager::open` (B1); cleared
+        // once this call either finishes or fully rolls back.
+        fs::write(
+            &marker,
+            format!(
+                r#"{{"op":"install","package":"{}","version":"{}"}}"#,
+                manifest.name, manifest.version
+            ),
+        )?;
         let disk_result: Result<()> = (|| {
             fs::rename(&files_dir, &destination)?;
             undo.push(Undo::RemoveDirAll(destination.clone()));
@@ -639,14 +675,19 @@ impl Manager {
             // Undo::RemoveDirAll only removed `destination` itself, so
             // clean those up too, stopping at pkgs/ itself.
             self.prune_empty_ancestors(&destination, &self.root.join("pkgs"));
-            return Err(if rollback_errors.is_empty() {
-                error
-            } else {
-                error.context(format!(
-                    "disk rollback left problems behind, run `yam repair`: {}",
-                    rollback_errors.join("; ")
-                ))
-            });
+            if rollback_errors.is_empty() {
+                // The rollback fully succeeded: disk and database agree
+                // again, so there is nothing left for `yam repair` to do.
+                let _ = fs::remove_file(&marker);
+                return Err(error);
+            }
+            // Otherwise leave the marker in place: the disk may still
+            // disagree with the database, and only `yam repair` should
+            // touch it next, not another install/remove.
+            return Err(error.context(format!(
+                "disk rollback left problems behind, run `yam repair`: {}",
+                rollback_errors.join("; ")
+            )));
         }
 
         transaction.commit()?;
@@ -664,6 +705,7 @@ impl Manager {
                 })?;
             }
         }
+        fs::remove_file(&marker).with_context(|| "remove the transaction marker".to_string())?;
         let _ = fs::remove_dir_all(staging);
         Ok(())
     }
@@ -733,6 +775,10 @@ impl Manager {
     }
 
     pub fn remove(&mut self, name: &str) -> Result<()> {
+        if self.interrupted {
+            bail!("a previous yam transaction did not finish; run `yam repair` before removing")
+        }
+        self.clear_stale_staging()?;
         validate_name(name)?;
         let (namespace, package) = split_name(name)?;
         let capabilities = {
@@ -786,6 +832,7 @@ impl Manager {
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             links
         };
+        let marker = self.transaction_marker_path();
         let transaction = self.db.transaction()?;
         transaction.execute("DELETE FROM packages WHERE name=?1", [name])?;
 
@@ -795,6 +842,9 @@ impl Manager {
         // the database side reverts to "still installed".
         let mut undo: Vec<Undo> = Vec::new();
         let mut links_removed: u32 = 0;
+        // See install_payload: recorded before the first disk write so a
+        // crash partway through is visible on the next open (B1).
+        fs::write(&marker, format!(r#"{{"op":"remove","package":"{name}"}}"#))?;
         let disk_result: Result<()> = (|| {
             for (path, target) in &links {
                 let link = self.root.join(path);
@@ -818,16 +868,18 @@ impl Manager {
         })();
         if let Err(error) = disk_result {
             let rollback_errors = unwind(undo);
-            // `transaction` is dropped here without being committed,
-            // which rolls the packages-row deletion back.
-            return Err(if rollback_errors.is_empty() {
-                error
-            } else {
-                error.context(format!(
-                    "disk rollback left problems behind, run `yam repair`: {}",
-                    rollback_errors.join("; ")
-                ))
-            });
+            // Drop `transaction` explicitly (without committing, which
+            // rolls the packages-row deletion back) so the marker
+            // cleanup below can borrow `self` again.
+            drop(transaction);
+            if rollback_errors.is_empty() {
+                let _ = fs::remove_file(&marker);
+                return Err(error);
+            }
+            return Err(error.context(format!(
+                "disk rollback left problems behind, run `yam repair`: {}",
+                rollback_errors.join("; ")
+            )));
         }
         transaction.commit()?;
         // A1: prune common-tree directories left empty by the links just
@@ -849,6 +901,7 @@ impl Manager {
         {
             let _ = fs::remove_dir(&namespace_root);
         }
+        fs::remove_file(&marker).with_context(|| "remove the transaction marker".to_string())?;
         Ok(())
     }
 
@@ -1012,7 +1065,8 @@ impl Manager {
 
     /// Restore only common-tree links that are recorded in YAM's state.
     /// Unowned files are never removed or replaced.
-    pub fn repair(&self) -> Result<Vec<String>> {
+    pub fn repair(&mut self) -> Result<Vec<String>> {
+        self.clear_stale_staging()?;
         let mut statement = self
             .db
             .prepare("SELECT path,target,package_name FROM links ORDER BY path")?;
@@ -1062,6 +1116,14 @@ impl Manager {
             make_link(&link, &target)?;
             repaired.push(path);
         }
+        // Whatever an interrupted transaction left behind, it's resolved
+        // now: clear the marker so mutating commands can run again.
+        let marker = self.transaction_marker_path();
+        if marker.is_file() {
+            fs::remove_file(&marker)?;
+            repaired.push("db/transaction.json".to_string());
+        }
+        self.interrupted = false;
         Ok(repaired)
     }
 
@@ -2313,7 +2375,7 @@ mod tests {
         let workdir = TempDir::new().unwrap();
         let profile = test_profile(workdir.path());
         let root = profile.paths.root.clone();
-        let manager = Manager::open(root.clone(), profile).unwrap();
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
 
         let stale = root.join(".staging").join("leftover-from-a-crash");
         fs::create_dir_all(&stale).unwrap();
