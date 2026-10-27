@@ -6,12 +6,6 @@ REPOSITORY=https://github.com/nyakokitsu/yam
 DEVICE_ROOT=${YAM_ROOT:-/data/yam}
 PLATFORM=${YAM_PLATFORM:-yandexmicro}
 
-case "$VERSION" in
-  latest) RELEASE_URL="$REPOSITORY/releases/latest/download"; SOURCE_REF=v2 ;;
-  v*) RELEASE_URL="$REPOSITORY/releases/download/$VERSION"; SOURCE_REF="$VERSION" ;;
-  *) RELEASE_URL="$REPOSITORY/releases/download/v$VERSION"; SOURCE_REF="v$VERSION" ;;
-esac
-
 TMPDIR_INSTALL=$(mktemp -d "${TMPDIR:-/tmp}/yam.XXXXXX")
 trap 'rm -rf "$TMPDIR_INSTALL"' EXIT HUP INT TERM
 
@@ -26,6 +20,24 @@ download() {
     exit 4
   fi
 }
+
+latest_tag() {
+  api="https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --proto '=https' --tlsv1.2 "$api"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- "$api"
+  else
+    return 1
+  fi | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(yam-v[^"]*\)".*/\1/p' | head -n 1
+}
+
+case "$VERSION" in
+  latest) TAG=$(latest_tag); [ -n "$TAG" ] || { echo 'Не найден релиз канала yam-v.' >&2; exit 4; }; SOURCE_REF=main ;;
+  yam-v*) TAG="$VERSION"; SOURCE_REF="$VERSION" ;;
+  *) TAG="yam-v$VERSION"; SOURCE_REF="$TAG" ;;
+esac
+RELEASE_URL="$REPOSITORY/releases/download/$TAG"
 
 verify() {
   file=$1

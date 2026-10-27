@@ -8,10 +8,13 @@ $ErrorActionPreference = "Stop"
 $repository = "https://github.com/nyakokitsu/yam"
 $deviceRoot = if ($env:YAM_ROOT) { $env:YAM_ROOT } else { "/data/yam" }
 if ($Version -eq "latest") {
-    $releaseUrl = "$repository/releases/latest/download"
-    $sourceRef = "v2"
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100" | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -like "yam-v*" } | Select-Object -First 1
+    if (-not $release) { throw "Не найден релиз канала yam-v." }
+    $tag = $release.tag_name
+    $releaseUrl = "$repository/releases/download/$tag"
+    $sourceRef = "main"
 } else {
-    $tag = if ($Version.StartsWith("v")) { $Version } else { "v$Version" }
+    $tag = if ($Version.StartsWith("yam-v")) { $Version } else { "yam-v$Version" }
     $releaseUrl = "$repository/releases/download/$tag"
     $sourceRef = $tag
 }
