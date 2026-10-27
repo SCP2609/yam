@@ -290,7 +290,11 @@ fn install_registry_graph(
         .collect::<BTreeMap<_, _>>();
     let download_dir = manager
         .root()
-        .join(".staging")
+        // `Manager::install` clears interrupted extraction directories under
+        // `.staging` before validating an archive. Registry downloads must
+        // therefore live in the normal cache tree until every graph member
+        // has been installed.
+        .join("cache")
         .join(format!("registry-{}", Uuid::new_v4()));
     fs::create_dir_all(&download_dir)?;
     let downloaded = (|| -> Result<Vec<(registry::ResolvedPackage, PathBuf)>> {
