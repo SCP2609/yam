@@ -2684,4 +2684,179 @@ mod tests {
             ".staging must be clean after a rejected archive"
         );
     }
+
+    #[test]
+    fn install_rejects_a_conflicting_package_without_replaces() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let soloist = workdir.path().join("soloist.yampkg");
+        TestPackage::new("yam/soloist", "1.0.0")
+            .file("bin/soloist-tool", b"soloist")
+            .provides("spotify-connect")
+            .pack(&workdir.path().join("soloist-src"), &profile, &soloist)
+            .unwrap();
+
+        let librespot = workdir.path().join("librespot.yampkg");
+        TestPackage::new("vasya/librespot", "1.0.0")
+            .file("bin/librespot-tool", b"librespot")
+            .provides("spotify-connect")
+            .conflicts("spotify-connect")
+            .pack(&workdir.path().join("librespot-src"), &profile, &librespot)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&soloist, true).unwrap();
+
+        let result = manager.install(&librespot, true);
+        assert!(
+            result.is_err(),
+            "a conflict with no replaces must be rejected, got {result:?}"
+        );
+        assert!(manager
+            .list()
+            .unwrap()
+            .iter()
+            .any(|p| p.name == "yam/soloist"));
+    }
+
+    #[test]
+    fn upgrading_a_package_that_conflicts_with_its_own_virtual_name_succeeds() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let v1 = workdir.path().join("v1.yampkg");
+        TestPackage::new("yam/soloist", "1.0.0")
+            .file("bin/soloist-tool", b"v1")
+            .provides("spotify-connect")
+            .conflicts("spotify-connect")
+            .pack(&workdir.path().join("src-1"), &profile, &v1)
+            .unwrap();
+        let v2 = workdir.path().join("v2.yampkg");
+        TestPackage::new("yam/soloist", "1.1.0")
+            .file("bin/soloist-tool", b"v2")
+            .provides("spotify-connect")
+            .conflicts("spotify-connect")
+            .pack(&workdir.path().join("src-2"), &profile, &v2)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&v1, true).unwrap();
+        manager.install(&v2, true).expect(
+            "upgrading a package that conflicts with its own provided virtual name \
+             must not be treated as a self-conflict",
+        );
+    }
+
+    #[test]
+    fn install_with_replaces_removes_the_conflicting_package_and_keeps_dependents_satisfied() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let soloist = workdir.path().join("soloist.yampkg");
+        TestPackage::new("yam/soloist", "1.0.0")
+            .file("bin/soloist-tool", b"soloist")
+            .provides("spotify-connect")
+            .conflicts("spotify-connect")
+            .replaces("spotify-connect")
+            .pack(&workdir.path().join("soloist-src"), &profile, &soloist)
+            .unwrap();
+
+        let led = workdir.path().join("led.yampkg");
+        TestPackage::new("petya/led", "1.0.0")
+            .file("bin/led-tool", b"led")
+            .depends("spotify-connect")
+            .pack(&workdir.path().join("led-src"), &profile, &led)
+            .unwrap();
+
+        let librespot = workdir.path().join("librespot.yampkg");
+        TestPackage::new("vasya/librespot", "1.0.0")
+            .file("bin/librespot-tool", b"librespot")
+            .provides("spotify-connect")
+            .conflicts("spotify-connect")
+            .replaces("spotify-connect")
+            .pack(&workdir.path().join("librespot-src"), &profile, &librespot)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&soloist, true).unwrap();
+        manager.install(&led, true).unwrap();
+
+        manager
+            .install(&librespot, true)
+            .expect("installing an explicit replacement for a conflicting provider must succeed");
+
+        let installed: Vec<String> = manager
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|package| package.name)
+            .collect();
+        assert!(
+            !installed.contains(&"yam/soloist".to_string()),
+            "the replaced package must be gone: {installed:?}"
+        );
+        assert!(installed.contains(&"vasya/librespot".to_string()));
+        assert!(
+            installed.contains(&"petya/led".to_string()),
+            "a dependent satisfied through the replaced virtual capability must remain installed"
+        );
+        assert!(
+            !root.join("pkgs/yam/soloist").exists(),
+            "the replaced package's payload directory must be gone"
+        );
+    }
+
+    #[test]
+    fn install_rejects_replacing_a_package_an_exact_name_dependency_still_needs() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let soloist = workdir.path().join("soloist.yampkg");
+        TestPackage::new("yam/soloist", "1.0.0")
+            .file("bin/soloist-tool", b"soloist")
+            .provides("spotify-connect")
+            .conflicts("spotify-connect")
+            .replaces("spotify-connect")
+            .pack(&workdir.path().join("soloist-src"), &profile, &soloist)
+            .unwrap();
+
+        let pinned = workdir.path().join("pinned.yampkg");
+        TestPackage::new("petya/pinned", "1.0.0")
+            .file("bin/pinned-tool", b"pinned")
+            .depends("yam/soloist")
+            .pack(&workdir.path().join("pinned-src"), &profile, &pinned)
+            .unwrap();
+
+        let librespot = workdir.path().join("librespot.yampkg");
+        TestPackage::new("vasya/librespot", "1.0.0")
+            .file("bin/librespot-tool", b"librespot")
+            .provides("spotify-connect")
+            .conflicts("spotify-connect")
+            .replaces("spotify-connect")
+            .pack(&workdir.path().join("librespot-src"), &profile, &librespot)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&soloist, true).unwrap();
+        manager.install(&pinned, true).unwrap();
+
+        let result = manager.install(&librespot, true);
+        assert!(
+            result.is_err(),
+            "replacing a package an exact-name dependency still needs must fail, got {result:?}"
+        );
+        assert!(
+            manager
+                .list()
+                .unwrap()
+                .iter()
+                .any(|p| p.name == "yam/soloist"),
+            "yam/soloist must remain installed after the rejected replace"
+        );
+    }
 }
