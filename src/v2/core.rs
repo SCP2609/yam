@@ -1738,4 +1738,84 @@ mod tests {
         );
         assert_eq!(fs::read(&foreign).unwrap(), b"not part of the package");
     }
+
+    #[test]
+    fn doctor_detects_an_untracked_symlink_into_pkgs() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/plug-tool", b"payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&artifact, true).unwrap();
+
+        // Planted by hand, bypassing the manager entirely: a symlink into
+        // pkgs/ that the links table never recorded.
+        let rogue = root.join("bin/rogue-tool");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("pkgs/vasya/plug/1.0.0/bin/plug-tool"), &rogue)
+            .unwrap();
+
+        let problems = manager.doctor().unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("bin/rogue-tool")),
+            "doctor must report an untracked symlink into pkgs/, got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_detects_a_stale_version_directory() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/plug-tool", b"payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&artifact, true).unwrap();
+
+        // Planted by hand: a leftover version directory that is not the
+        // one recorded as current (as if a crash interrupted cleanup).
+        let stale = root.join("pkgs/vasya/plug/0.9.0");
+        fs::create_dir_all(&stale).unwrap();
+
+        let problems = manager.doctor().unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("0.9.0")),
+            "doctor must report a stale version directory, got {problems:?}"
+        );
+    }
+
+    #[test]
+    fn doctor_detects_a_package_missing_its_payload_directory() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/plug-tool", b"payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.install(&artifact, true).unwrap();
+
+        fs::remove_dir_all(root.join("pkgs/vasya/plug/1.0.0")).unwrap();
+
+        let problems = manager.doctor().unwrap();
+        assert!(
+            problems.iter().any(|p| p.contains("vasya/plug")),
+            "doctor must report a package whose payload directory is gone, got {problems:?}"
+        );
+    }
 }
