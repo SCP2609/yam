@@ -1184,11 +1184,168 @@ fn set_payload_mode(path: &Path, payload_path: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
+
     #[test]
     fn package_names_and_payload_paths_are_strict() {
         assert!(validate_name("nikita/soloist").is_ok());
         assert!(validate_name("soloist").is_err());
         assert!(validate_payload_path("share/host/a.lua").is_ok());
         assert!(validate_payload_path("../etc/passwd").is_err());
+    }
+
+    /// A platform profile whose every path lives under a fresh temp dir,
+    /// so tests never touch a real filesystem location or each other.
+    fn test_profile(workdir: &Path) -> PlatformProfile {
+        serde_yaml::from_str(&format!(
+            "id: testplatform\narch: aarch64\ntriple: aarch64-unknown-linux-musl\npaths:\n  root: {:?}\n  etc: {:?}\n  var: {:?}\n  run: {:?}\n",
+            workdir.join("root"),
+            workdir.join("etc"),
+            workdir.join("var"),
+            workdir.join("run"),
+        ))
+        .expect("inline test profile must parse")
+    }
+
+    /// Builder for a `yam.yaml` source tree, packed through `Manager::pack`
+    /// exactly as a real package author would. Shared by every test below
+    /// that needs an installable `.yampkg`.
+    struct TestPackage {
+        name: String,
+        version: String,
+        files: Vec<(String, Vec<u8>)>,
+        depends: Vec<String>,
+        provides: Vec<String>,
+        conflicts: Vec<String>,
+        replaces: Vec<String>,
+    }
+    impl TestPackage {
+        fn new(name: &str, version: &str) -> Self {
+            Self {
+                name: name.into(),
+                version: version.into(),
+                files: Vec::new(),
+                depends: Vec::new(),
+                provides: Vec::new(),
+                conflicts: Vec::new(),
+                replaces: Vec::new(),
+            }
+        }
+        fn file(mut self, path: &str, content: &[u8]) -> Self {
+            self.files.push((path.into(), content.to_vec()));
+            self
+        }
+        #[allow(dead_code)]
+        fn depends(mut self, value: &str) -> Self {
+            self.depends.push(value.into());
+            self
+        }
+        #[allow(dead_code)]
+        fn provides(mut self, value: &str) -> Self {
+            self.provides.push(value.into());
+            self
+        }
+        #[allow(dead_code)]
+        fn conflicts(mut self, value: &str) -> Self {
+            self.conflicts.push(value.into());
+            self
+        }
+        #[allow(dead_code)]
+        fn replaces(mut self, value: &str) -> Self {
+            self.replaces.push(value.into());
+            self
+        }
+
+        /// Write the source tree under `source_dir` and pack it into `output`.
+        fn pack(&self, source_dir: &Path, profile: &PlatformProfile, output: &Path) -> Result<()> {
+            fs::create_dir_all(source_dir)?;
+            let mut files_entry = String::new();
+            for (path, _) in &self.files {
+                files_entry += &format!("  {path}: {path}\n");
+            }
+            let yaml = format!(
+                "name: {}\nversion: {}\nlicense: MIT\ndescription: test package\ntargets: [any]\nfiles:\n{}depends: [{}]\nprovides: [{}]\nconflicts: [{}]\nreplaces: [{}]\n",
+                self.name,
+                self.version,
+                files_entry,
+                self.depends.join(", "),
+                self.provides.join(", "),
+                self.conflicts.join(", "),
+                self.replaces.join(", "),
+            );
+            fs::write(source_dir.join("yam.yaml"), yaml)?;
+            for (path, content) in &self.files {
+                let full = source_dir.join(path);
+                if let Some(parent) = full.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(full, content)?;
+            }
+            Manager::pack(source_dir, profile, output)
+        }
+    }
+
+    #[test]
+    fn install_refuses_to_overwrite_a_foreign_regular_file() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/busybox-tool", b"yam payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let root = profile.paths.root.clone();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/busybox-tool"), b"not yam's file").unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        match manager.install(&artifact, true) {
+            Ok(_) => panic!("install must refuse to overwrite the foreign file at bin/busybox-tool"),
+            Err(error) => assert!(
+                error.to_string().contains("bin/busybox-tool"),
+                "error should name the offending path, was: {error}"
+            ),
+        }
+
+        assert_eq!(
+            fs::read(root.join("bin/busybox-tool")).unwrap(),
+            b"not yam's file"
+        );
+        assert!(manager.list().unwrap().is_empty());
+        assert!(!root.join("pkgs/vasya/plug").exists());
+    }
+
+    #[test]
+    fn install_refuses_to_overwrite_a_foreign_symlink() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let artifact = workdir.path().join("plug.yampkg");
+        TestPackage::new("vasya/plug", "1.0.0")
+            .file("bin/busybox-tool", b"yam payload")
+            .pack(&workdir.path().join("src"), &profile, &artifact)
+            .unwrap();
+
+        let root = profile.paths.root.clone();
+        fs::create_dir_all(root.join("bin")).unwrap();
+        let elsewhere = workdir.path().join("elsewhere");
+        fs::write(&elsewhere, b"not managed by yam").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&elsewhere, root.join("bin/busybox-tool")).unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        match manager.install(&artifact, true) {
+            Ok(_) => panic!("install must refuse to replace the foreign symlink at bin/busybox-tool"),
+            Err(error) => assert!(
+                error.to_string().contains("bin/busybox-tool"),
+                "error should name the offending path, was: {error}"
+            ),
+        }
+
+        assert_eq!(
+            fs::read_link(root.join("bin/busybox-tool")).unwrap(),
+            elsewhere
+        );
+        assert!(manager.list().unwrap().is_empty());
     }
 }
