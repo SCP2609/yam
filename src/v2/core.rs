@@ -380,6 +380,35 @@ impl Manager {
             .join(namespace)
             .join(package)
             .join(&manifest.version);
+
+        // Refuse before touching disk if a linkable path collides with
+        // something YAM does not own: a different package's link, or a
+        // plain file/symlink nobody created through YAM.
+        for path in manifest.files_sha256.keys().filter(|path| linkable(path)) {
+            let owner: Option<String> = self
+                .db
+                .query_row(
+                    "SELECT package_name FROM links WHERE path=?1",
+                    [path],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match owner {
+                Some(owner) if owner == manifest.name => {}
+                Some(owner) if manifest.replaces.iter().any(|name| name == &owner) => {}
+                Some(owner) => bail!("{path} is already owned by {owner}"),
+                None => {
+                    let link = self.root.join(path);
+                    if link.is_symlink() || link.exists() {
+                        bail!(
+                            "refusing to overwrite {path}: {} is not a YAM-owned link",
+                            describe_obstruction(&link)
+                        )
+                    }
+                }
+            }
+        }
+
         let files_dir = staging.join("files");
         for (path, bytes) in payload {
             let out = files_dir.join(path);
@@ -406,20 +435,6 @@ impl Manager {
                 )
             }
             let _ = old_payload;
-        }
-        for path in manifest.files_sha256.keys().filter(|path| linkable(path)) {
-            let owner: Option<String> = transaction
-                .query_row(
-                    "SELECT package_name FROM links WHERE path=?1",
-                    [path],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(owner) = owner {
-                if owner != manifest.name && !manifest.replaces.iter().any(|name| name == &owner) {
-                    bail!("{} is already owned by {owner}", path)
-                }
-            }
         }
         if destination.exists() {
             bail!(
@@ -1141,6 +1156,21 @@ fn digest_file(path: &Path) -> Result<String> {
 fn digest_bytes(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
+/// Describe whatever already exists at `path`, for an actionable
+/// "refusing to overwrite" error (A2).
+fn describe_obstruction(path: &Path) -> String {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => format!(
+            "a symlink to {}",
+            fs::read_link(path)
+                .map(|target| target.display().to_string())
+                .unwrap_or_else(|_| "<unreadable>".into())
+        ),
+        Ok(meta) if meta.is_dir() => "a directory".into(),
+        Ok(_) => "a regular file".into(),
+        Err(_) => "an unknown filesystem entry".into(),
+    }
+}
 fn linkable(path: &str) -> bool {
     path.starts_with("bin/") || path.starts_with("share/")
 }
@@ -1301,7 +1331,9 @@ mod tests {
 
         let mut manager = Manager::open(root.clone(), profile).unwrap();
         match manager.install(&artifact, true) {
-            Ok(_) => panic!("install must refuse to overwrite the foreign file at bin/busybox-tool"),
+            Ok(_) => {
+                panic!("install must refuse to overwrite the foreign file at bin/busybox-tool")
+            }
             Err(error) => assert!(
                 error.to_string().contains("bin/busybox-tool"),
                 "error should name the offending path, was: {error}"
@@ -1335,7 +1367,9 @@ mod tests {
 
         let mut manager = Manager::open(root.clone(), profile).unwrap();
         match manager.install(&artifact, true) {
-            Ok(_) => panic!("install must refuse to replace the foreign symlink at bin/busybox-tool"),
+            Ok(_) => {
+                panic!("install must refuse to replace the foreign symlink at bin/busybox-tool")
+            }
             Err(error) => assert!(
                 error.to_string().contains("bin/busybox-tool"),
                 "error should name the offending path, was: {error}"
