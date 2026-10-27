@@ -1332,6 +1332,62 @@ mod tests {
         }
     }
 
+    /// A minimal, directly-constructed manifest, for tests that need to
+    /// write an archive bypassing `Manager::pack` (malicious/malformed
+    /// archives: A3, B4).
+    fn manifest_for(
+        name: &str,
+        version: &str,
+        target: &str,
+        arch: &str,
+        files: &[(&str, &[u8])],
+    ) -> PackageManifest {
+        PackageManifest {
+            name: name.into(),
+            version: version.into(),
+            license: "MIT".into(),
+            description: "test package".into(),
+            homepage: None,
+            target: target.into(),
+            arch: arch.into(),
+            depends: Vec::new(),
+            recommends: Vec::new(),
+            enhances: Vec::new(),
+            provides: Vec::new(),
+            conflicts: Vec::new(),
+            replaces: Vec::new(),
+            permissions: Vec::new(),
+            entware: None,
+            services: BTreeMap::new(),
+            files_sha256: files
+                .iter()
+                .map(|(path, content)| (path.to_string(), digest_bytes(content)))
+                .collect(),
+        }
+    }
+
+    /// Build a `.yampkg` by hand (MANIFEST.yaml + files/*), bypassing every
+    /// check `Manager::pack` performs on a well-behaved source tree.
+    fn build_raw_archive(
+        output: &Path,
+        manifest: &PackageManifest,
+        files: &[(&str, &[u8])],
+    ) -> Result<()> {
+        let file = fs::File::create(output)?;
+        let encoder = zstd::Encoder::new(file, 1)?;
+        let mut archive = Builder::new(encoder.auto_finish());
+        append_bytes(
+            &mut archive,
+            "MANIFEST.yaml",
+            serde_yaml::to_string(manifest)?.as_bytes(),
+        )?;
+        for (path, content) in files {
+            append_bytes(&mut archive, &format!("files/{path}"), content)?;
+        }
+        archive.finish()?;
+        Ok(())
+    }
+
     #[test]
     fn install_refuses_to_overwrite_a_foreign_regular_file() {
         let workdir = TempDir::new().unwrap();
@@ -1431,5 +1487,70 @@ mod tests {
             foreign_target,
             "the foreign symlink must be left untouched"
         );
+    }
+
+    #[test]
+    fn pack_rejects_a_share_path_missing_the_namespace_prefix() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let artifact = workdir.path().join("bad.yampkg");
+        let result = TestPackage::new("vasya/bad", "1.0.0")
+            .file("share/lua-runtime/plugins/main.lua", b"return {}")
+            .pack(&workdir.path().join("src"), &profile, &artifact);
+        assert!(
+            result.is_err(),
+            "pack must reject a share/ path without the vasya. prefix, got {result:?}"
+        );
+        assert!(!artifact.exists());
+    }
+
+    #[test]
+    fn pack_allows_a_share_path_with_the_namespace_prefix() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let artifact = workdir.path().join("plug.yampkg");
+        let result = TestPackage::new("vasya/plug", "1.0.0")
+            .file(
+                "share/lua-runtime/plugins/vasya.plug/main.lua",
+                b"return {}",
+            )
+            .pack(&workdir.path().join("src"), &profile, &artifact);
+        assert!(
+            result.is_ok(),
+            "prefixed share/ path must be allowed: {result:?}"
+        );
+    }
+
+    #[test]
+    fn pack_allows_yam_namespace_without_a_prefix() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let artifact = workdir.path().join("x.yampkg");
+        let result = TestPackage::new("yam/x", "1.0.0")
+            .file("share/lua-runtime/plugins/main.lua", b"return {}")
+            .pack(&workdir.path().join("src"), &profile, &artifact);
+        assert!(
+            result.is_ok(),
+            "yam/ packages are exempt from the prefix rule: {result:?}"
+        );
+    }
+
+    #[test]
+    fn install_rejects_an_archive_with_a_share_path_missing_the_namespace_prefix() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let files: [(&str, &[u8]); 1] = [("share/lua-runtime/plugins/main.lua", b"return {}")];
+        let manifest = manifest_for("vasya/bad", "1.0.0", "any", &profile.arch, &files);
+        let artifact = workdir.path().join("bad.yampkg");
+        build_raw_archive(&artifact, &manifest, &files).unwrap();
+
+        let root = profile.paths.root.clone();
+        let mut manager = Manager::open(root, profile).unwrap();
+        let result = manager.install(&artifact, true);
+        assert!(
+            result.is_err(),
+            "install must reject a share/ path without the namespace prefix even when pack was bypassed, got {result:?}"
+        );
+        assert!(manager.list().unwrap().is_empty());
     }
 }
