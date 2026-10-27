@@ -1021,8 +1021,40 @@ fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
             bail!("invalid SHA-256 for {path}")
         }
     }
+    validate_share_namespace(manifest)?;
     for (name, service) in &manifest.services {
         validate_service(name, service, &manifest.files_sha256)?;
+    }
+    Ok(())
+}
+/// Every `share/` path for a package outside `yam/` must contain a path
+/// component scoped to that package (`<namespace>.<name>` or starting
+/// with `<namespace>.`), so one host's shared directory (such as
+/// `share/lua-runtime/plugins/`) can't be polluted by an unscoped file.
+/// `yam/` packages are exempt; `bin/` is unaffected (A2 covers its
+/// collisions).
+fn validate_share_namespace(manifest: &PackageManifest) -> Result<()> {
+    let (namespace, _) = split_name(&manifest.name)?;
+    if namespace == "yam" {
+        return Ok(());
+    }
+    let prefix = format!("{namespace}.");
+    for path in manifest
+        .files_sha256
+        .keys()
+        .filter(|path| path.starts_with("share/"))
+    {
+        let scoped = Path::new(path).components().any(|component| {
+            component
+                .as_os_str()
+                .to_str()
+                .is_some_and(|value| value.starts_with(&prefix))
+        });
+        if !scoped {
+            bail!(
+                "{path} is outside yam/ and must contain a path component starting with {prefix:?}"
+            )
+        }
     }
     Ok(())
 }
