@@ -464,6 +464,11 @@ impl Manager {
             "DELETE FROM services WHERE package_name=?1",
             [&manifest.name],
         )?;
+        transaction.execute(
+            "INSERT INTO packages(name,version,target,payload_path) VALUES(?1,?2,?3,?4)
+             ON CONFLICT(name) DO UPDATE SET version=excluded.version,target=excluded.target,payload_path=excluded.payload_path",
+            params![manifest.name, manifest.version, manifest.target, destination.to_string_lossy()],
+        )?;
         for capability in &manifest.provides {
             validate_capability(capability)?;
             transaction.execute(
@@ -484,11 +489,6 @@ impl Manager {
             )?;
         }
         transaction.execute("DELETE FROM links WHERE package_name=?1", [&manifest.name])?;
-        transaction.execute(
-            "INSERT INTO packages(name,version,target,payload_path) VALUES(?1,?2,?3,?4)
-             ON CONFLICT(name) DO UPDATE SET version=excluded.version,target=excluded.target,payload_path=excluded.payload_path",
-            params![manifest.name, manifest.version, manifest.target, destination.to_string_lossy()],
-        )?;
         for (path, hash) in &manifest.files_sha256 {
             transaction.execute(
                 "INSERT INTO package_files(package_name,path,sha256) VALUES(?1,?2,?3)",
