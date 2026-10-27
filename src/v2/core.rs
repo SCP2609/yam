@@ -203,7 +203,7 @@ pub struct Manager {
 /// bytes actually read rather than any size a tar header claims (B4): a
 /// small compressed artifact can still decompress to something huge.
 #[derive(Debug, Clone)]
-struct ArchiveLimits {
+pub(crate) struct ArchiveLimits {
     max_compressed_bytes: u64,
     max_total_unpacked_bytes: u64,
     max_file_bytes: u64,
@@ -455,7 +455,15 @@ impl Manager {
             bail!("a previous yam transaction did not finish; run `yam repair` before installing")
         }
         self.clear_stale_staging()?;
-        let (manifest, payload) = read_artifact(artifact)?;
+        let staging = self.root.join(".staging").join(Uuid::new_v4().to_string());
+        fs::create_dir_all(staging.join("files"))?;
+        let manifest = match extract_artifact(artifact, &staging, &self.archive_limits()) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        };
         validate_manifest(&manifest)?;
         if manifest.target != "any" && manifest.target != self.profile.id {
             bail!(
@@ -484,9 +492,7 @@ impl Manager {
             )
         }
         self.ensure_entware(&manifest, yes)?;
-        let staging = self.root.join(".staging").join(Uuid::new_v4().to_string());
-        fs::create_dir_all(&staging)?;
-        let result = self.install_payload(&manifest, &payload, &staging);
+        let result = self.install_payload(&manifest, &staging);
         if result.is_err() {
             let _ = fs::remove_dir_all(&staging);
         }
@@ -494,12 +500,7 @@ impl Manager {
         Ok(manifest)
     }
 
-    fn install_payload(
-        &mut self,
-        manifest: &PackageManifest,
-        payload: &[(String, Vec<u8>)],
-        staging: &Path,
-    ) -> Result<()> {
+    fn install_payload(&mut self, manifest: &PackageManifest, staging: &Path) -> Result<()> {
         let (namespace, package) = split_name(&manifest.name)?;
         let destination = self
             .root
@@ -536,15 +537,10 @@ impl Manager {
             }
         }
 
+        // Payload files are already written under `staging/files/` by
+        // `extract_artifact`; only the directory itself is renamed into
+        // place below.
         let files_dir = staging.join("files");
-        for (path, bytes) in payload {
-            let out = files_dir.join(path);
-            if let Some(parent) = out.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&out, bytes)?;
-            set_payload_mode(&out, path)?;
-        }
         let marker = self.transaction_marker_path();
         let transaction = self.db.transaction()?;
         let existing: Option<(String, String)> = transaction
@@ -1332,53 +1328,176 @@ fn insert_payload(
     Ok(())
 }
 
-fn read_artifact(path: &Path) -> Result<(PackageManifest, Vec<(String, Vec<u8>)>)> {
+/// Stream a `.yampkg`'s tar.zst straight into `staging/files/`, writing
+/// and hashing each payload file as its bytes are read rather than
+/// buffering the archive or any entry in memory (B4). Every limit is
+/// checked against bytes actually read, never a tar header's claimed
+/// size, since a small compressed artifact can still decompress to
+/// something unbounded. `MANIFEST.yaml` must be the first entry, as
+/// `Manager::pack` already writes it.
+fn extract_artifact(
+    path: &Path,
+    staging: &Path,
+    limits: &ArchiveLimits,
+) -> Result<PackageManifest> {
+    let compressed_size = fs::metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .len();
+    if compressed_size > limits.max_compressed_bytes {
+        bail!(
+            "{} is {} bytes, over the {}-byte compressed artifact limit",
+            path.display(),
+            compressed_size,
+            limits.max_compressed_bytes
+        )
+    }
     let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let decoder =
         zstd::Decoder::new(file).context(".yampkg must be a zstd-compressed tar archive")?;
     let mut archive = Archive::new(decoder);
-    let mut manifest = None;
-    let mut payload = BTreeMap::new();
+    let files_dir = staging.join("files");
+    let mut manifest: Option<PackageManifest> = None;
+    let mut computed_hashes: BTreeMap<String, String> = BTreeMap::new();
+    let mut total_unpacked: u64 = 0;
+    let mut entry_count: u64 = 0;
+    let mut first_entry = true;
+
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?.into_owned();
-        safe_tar_path(&path)?;
+        entry_count += 1;
+        if entry_count > limits.max_entries {
+            bail!(
+                "archive has more than the {}-entry limit",
+                limits.max_entries
+            )
+        }
+        let entry_path = entry.path()?.into_owned();
+        safe_tar_path(&entry_path)?;
+        let name = entry_path.to_string_lossy().to_string();
+        if first_entry {
+            if name != "MANIFEST.yaml" {
+                bail!("the first archive entry must be MANIFEST.yaml, found {name}")
+            }
+            first_entry = false;
+        }
         if entry.header().entry_type().is_dir() {
             continue;
         }
         if !entry.header().entry_type().is_file() {
-            bail!("unsupported archive entry {}", path.display())
+            bail!("unsupported archive entry {}", entry_path.display())
         }
-        let name = path.to_string_lossy().to_string();
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
         if name == "MANIFEST.yaml" {
             if manifest.is_some() {
                 bail!("duplicate MANIFEST.yaml")
             }
+            let mut bytes = Vec::new();
+            copy_bounded(
+                &mut entry,
+                &mut bytes,
+                limits.max_file_bytes,
+                &mut total_unpacked,
+                limits.max_total_unpacked_bytes,
+            )?;
             manifest = Some(serde_yaml::from_slice(&bytes)?);
         } else if let Some(relative) = name.strip_prefix("files/") {
             validate_payload_path(relative)?;
-            if payload.insert(relative.to_string(), bytes).is_some() {
+            if computed_hashes.contains_key(relative) {
                 bail!("duplicate payload path {relative}")
             }
-        } else if name != "SOURCE" {
+            let out = files_dir.join(relative);
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut hasher = Sha256::new();
+            {
+                let mut destination =
+                    fs::File::create(&out).with_context(|| format!("create {}", out.display()))?;
+                let mut writer = HashingWriter {
+                    inner: &mut destination,
+                    hasher: &mut hasher,
+                };
+                copy_bounded(
+                    &mut entry,
+                    &mut writer,
+                    limits.max_file_bytes,
+                    &mut total_unpacked,
+                    limits.max_total_unpacked_bytes,
+                )?;
+            }
+            set_payload_mode(&out, relative)?;
+            computed_hashes.insert(relative.to_string(), format!("{:x}", hasher.finalize()));
+        } else if name == "SOURCE" {
+            copy_bounded(
+                &mut entry,
+                &mut std::io::sink(),
+                limits.max_file_bytes,
+                &mut total_unpacked,
+                limits.max_total_unpacked_bytes,
+            )?;
+        } else {
             bail!("unexpected archive entry {name}")
         }
     }
     let manifest: PackageManifest = manifest.context("missing MANIFEST.yaml")?;
-    if payload.len() != manifest.files_sha256.len() {
+    if computed_hashes.len() != manifest.files_sha256.len() {
         bail!("manifest file list differs from payload")
     }
     for (path, expected) in &manifest.files_sha256 {
-        let bytes = payload
+        let actual = computed_hashes
             .get(path)
             .with_context(|| format!("manifest file missing from payload: {path}"))?;
-        if digest_bytes(bytes) != *expected {
+        if actual != expected {
             bail!("checksum mismatch for {path}")
         }
     }
-    Ok((manifest, payload.into_iter().collect()))
+    Ok(manifest)
+}
+
+/// Copy `reader` into `writer` in chunks, bailing as soon as either the
+/// single entry or the running archive total exceeds its limit --
+/// checked against bytes actually transferred, not a header's claim.
+fn copy_bounded<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    max_file_bytes: u64,
+    total_unpacked: &mut u64,
+    max_total_unpacked_bytes: u64,
+) -> Result<()> {
+    let mut buffer = [0u8; 64 * 1024];
+    let mut file_bytes: u64 = 0;
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        file_bytes += read as u64;
+        if file_bytes > max_file_bytes {
+            bail!("an archive entry is over the {max_file_bytes}-byte single-file limit")
+        }
+        *total_unpacked += read as u64;
+        if *total_unpacked > max_total_unpacked_bytes {
+            bail!("archive unpacks to more than the {max_total_unpacked_bytes}-byte limit")
+        }
+        writer.write_all(&buffer[..read])?;
+    }
+    Ok(())
+}
+
+/// Forwards writes to `inner` while feeding the same bytes to `hasher`,
+/// so a payload file is hashed in the same pass that writes it to disk.
+struct HashingWriter<'a, W: Write> {
+    inner: W,
+    hasher: &'a mut Sha256,
+}
+impl<W: Write> Write for HashingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.hasher.update(&buf[..written]);
+        Ok(written)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
