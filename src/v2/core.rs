@@ -1,4 +1,5 @@
 use anyhow::{bail, Context, Result};
+use fs4::fs_std::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -265,6 +266,30 @@ impl Manager {
         Ok(())
     }
 
+    /// Take an exclusive lock on `$YAM_RUN/yam.lock` for the whole of a
+    /// mutating command (B3). Held by keeping the returned `File` alive;
+    /// the lock releases automatically when it drops. Fails immediately
+    /// (no blocking wait) if another yam transaction already holds it --
+    /// a host scanning shared directories is expected to take a shared
+    /// lock on the same path instead.
+    fn lock_transaction(&self) -> Result<fs::File> {
+        let run_dir = &self.profile.paths.run;
+        fs::create_dir_all(run_dir).with_context(|| format!("create {}", run_dir.display()))?;
+        let lock_path = run_dir.join("yam.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&lock_path)
+            .with_context(|| format!("open {}", lock_path.display()))?;
+        file.try_lock_exclusive().with_context(|| {
+            format!(
+                "another yam transaction is running (locked: {})",
+                lock_path.display()
+            )
+        })?;
+        Ok(file)
+    }
+
     pub fn profile(&self) -> &PlatformProfile {
         &self.profile
     }
@@ -385,6 +410,7 @@ impl Manager {
     }
 
     pub fn install(&mut self, artifact: &Path, yes: bool) -> Result<PackageManifest> {
+        let _lock = self.lock_transaction()?;
         if self.interrupted {
             bail!("a previous yam transaction did not finish; run `yam repair` before installing")
         }
@@ -775,6 +801,7 @@ impl Manager {
     }
 
     pub fn remove(&mut self, name: &str) -> Result<()> {
+        let _lock = self.lock_transaction()?;
         if self.interrupted {
             bail!("a previous yam transaction did not finish; run `yam repair` before removing")
         }
@@ -1066,6 +1093,7 @@ impl Manager {
     /// Restore only common-tree links that are recorded in YAM's state.
     /// Unowned files are never removed or replaced.
     pub fn repair(&mut self) -> Result<Vec<String>> {
+        let _lock = self.lock_transaction()?;
         self.clear_stale_staging()?;
         let mut statement = self
             .db
