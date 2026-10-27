@@ -40,7 +40,7 @@ yam --platform yandexmicro --root ./test-root doctor
 
 Для пакетов не из `yam/` каждый путь в `share/` должен содержать компонент
 `<namespace>.<name>` или начинающийся с `<namespace>.`, например
-`share/lua-runtime/plugins/nikita.soloist/main.lua`. Пакеты `yam/` от
+`share/host/plugins/nikita.soloist/main.lua`. Пакеты `yam/` от
 правила освобождены; `bin/` правило не касается.
 
 Архив ограничен по размеру и числу записей: не более 64 МиБ в сжатом виде,

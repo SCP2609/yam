@@ -312,7 +312,7 @@ fn pack_rejects_a_share_path_missing_the_namespace_prefix() {
     let profile = test_profile(workdir.path());
     let artifact = workdir.path().join("bad.yampkg");
     let result = TestPackage::new("vasya/bad", "1.0.0")
-        .file("share/lua-runtime/plugins/main.lua", b"return {}")
+        .file("share/host/plugins/main.lua", b"return {}")
         .pack(&workdir.path().join("src"), &profile, &artifact);
     assert!(
         result.is_err(),
@@ -325,7 +325,7 @@ fn pack_rejects_a_share_path_missing_the_namespace_prefix() {
 fn install_rejects_an_archive_with_a_share_path_missing_the_namespace_prefix() {
     let workdir = TempDir::new().unwrap();
     let profile = test_profile(workdir.path());
-    let files: [(&str, &[u8]); 1] = [("share/lua-runtime/plugins/main.lua", b"return {}")];
+    let files: [(&str, &[u8]); 1] = [("share/host/plugins/main.lua", b"return {}")];
     let manifest = manifest_for("vasya/bad", "1.0.0", "any", &profile.arch, &files);
     let artifact = workdir.path().join("bad.yampkg");
     build_raw_archive(&artifact, &manifest, &files).unwrap();
@@ -417,14 +417,14 @@ fn upgrade_removes_stale_links_and_old_version_directory() {
 
     let v1 = workdir.path().join("plug-1.0.0.yampkg");
     TestPackage::new("vasya/plug", "1.0.0")
-        .file("share/lua-runtime/plugins/vasya.plug/main.lua", b"v1 main")
-        .file("share/lua-runtime/plugins/vasya.plug/old.lua", b"v1 old")
+        .file("share/host/plugins/vasya.plug/main.lua", b"v1 main")
+        .file("share/host/plugins/vasya.plug/old.lua", b"v1 old")
         .pack(&workdir.path().join("src-1"), &profile, &v1)
         .unwrap();
 
     let v2 = workdir.path().join("plug-1.1.0.yampkg");
     TestPackage::new("vasya/plug", "1.1.0")
-        .file("share/lua-runtime/plugins/vasya.plug/main.lua", b"v2 main")
+        .file("share/host/plugins/vasya.plug/main.lua", b"v2 main")
         .pack(&workdir.path().join("src-2"), &profile, &v2)
         .unwrap();
 
@@ -432,7 +432,7 @@ fn upgrade_removes_stale_links_and_old_version_directory() {
     manager.install(&v1, true).unwrap();
     manager.install(&v2, true).unwrap();
 
-    let old_lua = root.join("share/lua-runtime/plugins/vasya.plug/old.lua");
+    let old_lua = root.join("share/host/plugins/vasya.plug/old.lua");
     assert!(
         !old_lua.exists() && !old_lua.is_symlink(),
         "old.lua from 1.0.0 must be gone after upgrading to 1.1.0"
@@ -443,7 +443,7 @@ fn upgrade_removes_stale_links_and_old_version_directory() {
     );
     assert_eq!(
         manager.files("vasya/plug").unwrap(),
-        vec!["share/lua-runtime/plugins/vasya.plug/main.lua".to_string()]
+        vec!["share/host/plugins/vasya.plug/main.lua".to_string()]
     );
     assert!(
         manager.doctor().unwrap().is_empty(),
@@ -459,13 +459,13 @@ fn remove_deletes_every_version_and_prunes_now_empty_directories() {
 
     let v1 = workdir.path().join("plug-1.0.0.yampkg");
     TestPackage::new("vasya/plug", "1.0.0")
-        .file("share/lua-runtime/plugins/vasya.plug/main.lua", b"v1 main")
-        .file("share/lua-runtime/plugins/vasya.plug/old.lua", b"v1 old")
+        .file("share/host/plugins/vasya.plug/main.lua", b"v1 main")
+        .file("share/host/plugins/vasya.plug/old.lua", b"v1 old")
         .pack(&workdir.path().join("src-1"), &profile, &v1)
         .unwrap();
     let v2 = workdir.path().join("plug-1.1.0.yampkg");
     TestPackage::new("vasya/plug", "1.1.0")
-        .file("share/lua-runtime/plugins/vasya.plug/main.lua", b"v2 main")
+        .file("share/host/plugins/vasya.plug/main.lua", b"v2 main")
         .pack(&workdir.path().join("src-2"), &profile, &v2)
         .unwrap();
 
@@ -480,7 +480,7 @@ fn remove_deletes_every_version_and_prunes_now_empty_directories() {
         "every version directory must be gone after remove"
     );
     assert!(
-        !root.join("share/lua-runtime/plugins/vasya.plug").exists(),
+        !root.join("share/host/plugins/vasya.plug").exists(),
         "the now-empty package-specific share/ directory must be pruned"
     );
 }
@@ -493,14 +493,14 @@ fn remove_does_not_delete_a_foreign_file_left_in_a_shared_directory() {
 
     let artifact = workdir.path().join("plug.yampkg");
     TestPackage::new("vasya/plug", "1.0.0")
-        .file("share/lua-runtime/plugins/vasya.plug/main.lua", b"main")
+        .file("share/host/plugins/vasya.plug/main.lua", b"main")
         .pack(&workdir.path().join("src"), &profile, &artifact)
         .unwrap();
 
     let mut manager = Manager::open(root.clone(), profile).unwrap();
     manager.install(&artifact, true).unwrap();
 
-    let foreign = root.join("share/lua-runtime/plugins/vasya.plug/notes.txt");
+    let foreign = root.join("share/host/plugins/vasya.plug/notes.txt");
     fs::write(&foreign, b"not part of the package").unwrap();
 
     manager.remove("vasya/plug").unwrap();

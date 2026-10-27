@@ -240,7 +240,7 @@ pub(crate) fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
 /// Every `share/` path for a package outside `yam/` must contain a path
 /// component scoped to that package (`<namespace>.<name>` or starting
 /// with `<namespace>.`), so one host's shared directory (such as
-/// `share/lua-runtime/plugins/`) can't be polluted by an unscoped file.
+/// `share/host/plugins/`) can't be polluted by an unscoped file.
 /// `yam/` packages are exempt; `bin/` is unaffected (A2 covers its
 /// collisions).
 fn validate_share_namespace(manifest: &PackageManifest) -> Result<()> {

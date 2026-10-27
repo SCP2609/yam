@@ -201,11 +201,11 @@ Before committing, require a clean `git diff --check`. Never commit `target/`.
 
 ## Lua runtime rules
 
-Lua is a **host package**, planned as `yam/lua-runtime`; it is not a special
-case in the YAM package manager.
+Luna is a **host package**, published as `yam/luna`; it is not a special case
+in the YAM package manager.
 
-- The runtime discovers plugin files under
-  `$YAM_ROOT/share/lua-runtime/plugins/`. YAM only installs and links files;
+- Luna discovers plugin files under `$YAM_ROOT/share/luna/plugins/`. YAM only
+  installs and links files;
   it does not parse, start or authorize Lua plugins.
 - Lua plugin packages are ordinary `.yampkg` artifacts. Keep runtime-specific
   manifest, permission and API metadata inside the plugin's own files.
@@ -224,8 +224,8 @@ case in the YAM package manager.
   indefinitely; provide cancellation-aware sleep, I/O and event waiting.
 - Runtime code must discover hardware via platform capabilities or validated
   adapters. Never infer unknown-device paths from a model name.
-- A Lua runtime package can declare package-level dependencies like any other
-  host. Lua plugins should depend on the runtime package/version they require.
+- A Luna package can declare package-level dependencies like any other host.
+  Lua plugins should depend on the Luna package/version they require.
 
 ## General Rust and CLI rules
 

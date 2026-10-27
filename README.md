@@ -44,7 +44,7 @@ yam --platform yandexmicro --root ./yam-root install --yes package.yampkg
 - [Реестр](docs/REGISTRY.md)
 
 Lua, Quasar, веб-интерфейс и старые `.yap`/`plugin.toml` находятся в отдельном
-пакете [`packages/yam-lua-runtime/`](packages/yam-lua-runtime/), а не в ядре YAM.
+проекте [Luna](https://github.com/nyakokitsu/luna), а не в ядре YAM.
 
 ## Обновление
 

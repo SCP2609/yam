@@ -806,7 +806,7 @@ impl Manager {
     /// stopping as soon as a directory is non-empty or equals `floor`.
     /// Used after removing a link, or after rolling back a directory
     /// `create_dir_all` made room for, so an now-empty ancestor (e.g. a
-    /// package's own `share/lua-runtime/plugins/vasya.plug/`, or
+    /// package's own `share/host/plugins/vasya.plug/`, or
     /// `pkgs/vasya/plug` once its only version directory is gone) doesn't
     /// linger forever. Never removes a directory with anything left in
     /// it, owned by YAM or not, and never removes `floor` itself.
