@@ -192,6 +192,30 @@ pub struct Manager {
     /// removing the Nth link fails instead of succeeding.
     #[cfg(test)]
     fail_after_link_removals: Option<u32>,
+    /// Test-only override of the archive extraction limits (B4), so a
+    /// test can exceed a tiny limit without building a multi-megabyte
+    /// archive.
+    #[cfg(test)]
+    archive_limits_override: Option<ArchiveLimits>,
+}
+
+/// Hard ceilings enforced while extracting a `.yampkg`, checked against
+/// bytes actually read rather than any size a tar header claims (B4): a
+/// small compressed artifact can still decompress to something huge.
+#[derive(Debug, Clone)]
+struct ArchiveLimits {
+    max_compressed_bytes: u64,
+    max_total_unpacked_bytes: u64,
+    max_file_bytes: u64,
+    max_entries: u64,
+}
+impl ArchiveLimits {
+    const DEFAULT: Self = Self {
+        max_compressed_bytes: 64 * 1024 * 1024,
+        max_total_unpacked_bytes: 256 * 1024 * 1024,
+        max_file_bytes: 64 * 1024 * 1024,
+        max_entries: 10_000,
+    };
 }
 
 impl Manager {
@@ -249,6 +273,8 @@ impl Manager {
             fail_after_links: None,
             #[cfg(test)]
             fail_after_link_removals: None,
+            #[cfg(test)]
+            archive_limits_override: None,
         })
     }
 
@@ -309,6 +335,20 @@ impl Manager {
     #[cfg(test)]
     pub(crate) fn inject_remove_failure_after(&mut self, count: u32) {
         self.fail_after_link_removals = Some(count);
+    }
+
+    /// Test-only: override the archive extraction limits (B4).
+    #[cfg(test)]
+    pub(crate) fn inject_archive_limits(&mut self, limits: ArchiveLimits) {
+        self.archive_limits_override = Some(limits);
+    }
+
+    fn archive_limits(&self) -> ArchiveLimits {
+        #[cfg(test)]
+        if let Some(limits) = &self.archive_limits_override {
+            return limits.clone();
+        }
+        ArchiveLimits::DEFAULT
     }
 
     pub fn pack(source_dir: &Path, profile: &PlatformProfile, output: &Path) -> Result<()> {
@@ -2455,6 +2495,74 @@ mod tests {
         assert_eq!(
             before, after,
             "a refused install due to a held lock must change nothing on disk or in the database"
+        );
+    }
+
+    #[test]
+    fn install_rejects_an_archive_with_too_many_entries() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let files: Vec<(String, Vec<u8>)> = (0..20)
+            .map(|index| (format!("bin/tool-{index}"), b"x".to_vec()))
+            .collect();
+        let file_refs: Vec<(&str, &[u8])> = files
+            .iter()
+            .map(|(path, content)| (path.as_str(), content.as_slice()))
+            .collect();
+        let manifest = manifest_for("vasya/plug", "1.0.0", "any", &profile.arch, &file_refs);
+        let artifact = workdir.path().join("plug.yampkg");
+        build_raw_archive(&artifact, &manifest, &file_refs).unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.inject_archive_limits(ArchiveLimits {
+            max_entries: 5,
+            ..ArchiveLimits::DEFAULT
+        });
+        let result = manager.install(&artifact, true);
+        assert!(
+            result.is_err(),
+            "install must reject an archive with more entries than the limit, got {result:?}"
+        );
+        assert!(
+            fs::read_dir(root.join(".staging"))
+                .unwrap()
+                .next()
+                .is_none(),
+            ".staging must be clean after a rejected archive"
+        );
+    }
+
+    #[test]
+    fn install_rejects_an_archive_exceeding_the_unpacked_size_limit() {
+        let workdir = TempDir::new().unwrap();
+        let profile = test_profile(workdir.path());
+        let root = profile.paths.root.clone();
+
+        let big_content = vec![b'x'; 4096];
+        let files: [(&str, &[u8]); 1] = [("bin/big-tool", &big_content)];
+        let manifest = manifest_for("vasya/plug", "1.0.0", "any", &profile.arch, &files);
+        let artifact = workdir.path().join("plug.yampkg");
+        build_raw_archive(&artifact, &manifest, &files).unwrap();
+
+        let mut manager = Manager::open(root.clone(), profile).unwrap();
+        manager.inject_archive_limits(ArchiveLimits {
+            max_total_unpacked_bytes: 1024,
+            max_file_bytes: 1024,
+            ..ArchiveLimits::DEFAULT
+        });
+        let result = manager.install(&artifact, true);
+        assert!(
+            result.is_err(),
+            "install must reject an archive exceeding the unpacked size limit, got {result:?}"
+        );
+        assert!(
+            fs::read_dir(root.join(".staging"))
+                .unwrap()
+                .next()
+                .is_none(),
+            ".staging must be clean after a rejected archive"
         );
     }
 }
