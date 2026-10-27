@@ -9,7 +9,13 @@ $ErrorActionPreference = "Stop"
 $repository = "https://github.com/nyakokitsu/yam"
 $deviceRoot = if ($env:YAM_ROOT) { $env:YAM_ROOT } else { "/data/yam" }
 if ($Version -eq "latest") {
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100" | Where-Object { -not $_.draft -and -not $_.prerelease -and $_.tag_name -like "yam-v*" } | Select-Object -First 1
+    $apiHeaders = @{ "User-Agent" = "YAM-installer"; "Accept" = "application/vnd.github+json" }
+    $releases = @(Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100")
+    $release = @($releases | Where-Object {
+            ($_.draft -eq $false) -and
+            ($_.prerelease -eq $false) -and
+            ($_.tag_name -like "yam-v*")
+        })[0]
     if (-not $release) { throw "Не найден релиз канала yam-v." }
     $tag = $release.tag_name
     $releaseUrl = "$repository/releases/download/$tag"
