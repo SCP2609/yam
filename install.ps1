@@ -126,12 +126,12 @@ echo YAM-UNINSTALL-DONE
     }
     if ($Version -eq "latest") {
         $apiHeaders = @{ "User-Agent" = "YAM-installer"; "Accept" = "application/vnd.github+json" }
-        $releases = @(Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100")
-        $release = @($releases | Where-Object {
-                ($_.draft -eq $false) -and
-                ($_.prerelease -eq $false) -and
-                ($_.tag_name -like "yam-v*")
-            })[0]
+        $releases = Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100"
+        $release = $releases | ForEach-Object { $_ } | Where-Object {
+            ($_.draft -eq $false) -and
+            ($_.prerelease -eq $false) -and
+            ($_.tag_name -like "yam-v*")
+         } | Select-Object -First 1
         if (-not $release) { throw "Не найден релиз канала yam-v." }
         $tag = $release.tag_name
         $releaseUrl = "$repository/releases/download/$tag"
