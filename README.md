@@ -12,6 +12,12 @@
 curl -fsSL https://hackalice.me/install.sh | sh
 ```
 
+**Альтернативная ссылка** (если короткий URL ещё обновляется):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/nyakokitsu/yam/main/install.sh | sh
+```
+
 **Windows (PowerShell)**
 
 ```powershell

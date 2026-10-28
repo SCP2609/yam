@@ -6,6 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $repository = "https://github.com/nyakokitsu/yam"
 $deviceRoot = if ($env:YAM_ROOT) { $env:YAM_ROOT } else { "/data/yam" }
 if ($Version -eq "latest") {
@@ -28,6 +29,20 @@ if ($Version -eq "latest") {
 
 $adb = Get-Command adb -ErrorAction SilentlyContinue
 if (-not $adb) { throw "Нужен adb из Android Platform Tools." }
+
+function Download-File([string]$Uri, [string]$OutFile) {
+    $parameters = @{ Uri = $Uri; OutFile = $OutFile; ErrorAction = "Stop" }
+    if ($PSVersionTable.PSVersion.Major -lt 6) { $parameters.UseBasicParsing = $true }
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest @parameters
+            return
+        } catch {
+            if ($attempt -eq 3) { throw }
+            Start-Sleep -Seconds $attempt
+        }
+    }
+}
 
 function Get-Device {
     $devices = @(& adb devices | Select-Object -Skip 1 | ForEach-Object {
@@ -100,8 +115,8 @@ rm -rf "$legacy"
     $asset = if ($Platform -in @("mango", "jbl_link_music")) { "yam-armv7-unknown-linux-musleabihf" } else { "yam-aarch64-unknown-linux-musl" }
     $checksums = Join-Path $tmp "SHA256SUMS"
     $binary = Join-Path $tmp $asset
-    Invoke-WebRequest -Uri "$releaseUrl/SHA256SUMS" -OutFile $checksums
-    Invoke-WebRequest -Uri "$releaseUrl/$asset" -OutFile $binary
+    Download-File "$releaseUrl/SHA256SUMS" $checksums
+    Download-File "$releaseUrl/$asset" $binary
     $expected = ((Get-Content $checksums | Where-Object { $_ -match ("\s" + [regex]::Escape($asset) + "$") }) -split "\s+")[0]
     if (-not $expected -or (Get-FileHash -Algorithm SHA256 $binary).Hash.ToLowerInvariant() -ne $expected.ToLowerInvariant()) { throw "Контрольная сумма не совпадает." }
 
@@ -109,7 +124,7 @@ rm -rf "$legacy"
     & adb -s $serial push $binary "$deviceRoot/bin/yam.new" | Out-Null
     foreach ($profile in @("yandexmicro", "plum", "yandexplum", "yandexmini", "yandexmini_2", "bergamot", "pickle", "cucumber", "yandexmidi", "mango", "yandexstation_2", "yandexstation", "saturn", "jbl_link_music", "orion")) {
         $profileFile = Join-Path $tmp "$profile.yaml"
-        Invoke-WebRequest -Uri "$repository/raw/$sourceRef/platforms/$profile.yaml" -OutFile $profileFile
+        Download-File "$repository/raw/$sourceRef/platforms/$profile.yaml" $profileFile
         & adb -s $serial push $profileFile "$deviceRoot/platforms/$profile.yaml" | Out-Null
     }
     & adb -s $serial shell "chmod 0755 '$deviceRoot/bin/yam.new'; mv '$deviceRoot/bin/yam.new' '$deviceRoot/bin/yam'" | Out-Null
