@@ -127,10 +127,12 @@ yam install --yes ./package.yampkg
 
 Обновляет сам `yam` из GitHub Releases.
 
-1. Доступно только в сборке для aarch64 Linux и только при запуске
+1. Доступно только в сборках для Linux aarch64 (`aarch64-unknown-linux-musl`)
+   и Linux armv7 (`armv7-unknown-linux-musleabihf`) и только при запуске
    установленного файла с именем `yam`.
 2. Берёт последний опубликованный (не draft и не prerelease) релиз с тегом
-   `yam-v…`, скачивает `yam-update.json` и `yam-update.json.sig`.
+   `yam-v…`, скачивает `yam-update-<target>.json` и
+   `yam-update-<target>.json.sig` для своей сборки.
 3. Проверяет подпись Ed25519 манифеста ключом `YAM_UPDATE_PUBLIC_KEY`,
    зашитым при сборке. Сборка без ключа обновляться не может.
 4. Если версия совпадает с текущей, печатает
