@@ -48,13 +48,8 @@ yam --platform yandexmicro --root ./yam-root install --yes package.yampkg
 - [Упаковка](docs/PACKAGING.md)
 - [Реестр](docs/REGISTRY.md)
 - [Платформы](docs/PLATFORMS.md)
+- [Быстрый старт](docs/QUICKSTART.md)
+- [Сборка и публикация](docs/PUBLISHING.md)
 
 Lua, Quasar, веб-интерфейс и старые `.yap`/`plugin.toml` находятся в отдельном
 проекте [Luna](https://github.com/nyakokitsu/luna), а не в ядре YAM.
-
-## Обновление
-
-Установщик добавляет `/usr/bin/yam` на Micro и проверяет обновление при загрузке.
-Обновление принимается только при корректной Ed25519-подписи манифеста из
-GitHub Releases. Для публикации нужны repository variable `YAM_UPDATE_PUBLIC_KEY`
-и secret `YAM_UPDATE_SIGNING_KEY`.

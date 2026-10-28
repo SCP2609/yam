@@ -11,11 +11,15 @@ path = "src/bin/yam.rs"
 name = "yam-sign-update"
 path = "src/bin/yam_sign_update.rs"
 
+[[bin]]
+name = "yam-publish"
+path = "src/bin/yam_publish.rs"
+
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
-ed25519-dalek = "2"
+ed25519-dalek = { version = "2", features = ["pem"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
