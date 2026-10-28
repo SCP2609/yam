@@ -43,9 +43,10 @@ SQLite, OTA firmware comparison at boot.
 ## Repository map
 
 - `src/bin/yam.rs` — user-facing CLI (clap). Global `--platform`, `--root`.
-  Commands: `pack`, `install`, `remove`, `list`, `files`, `which`, `doctor`,
+  Commands: `install`, `remove`, `list`, `files`, `which`, `doctor`,
   `repair`, `update`, `entware status|list`, `service list`,
   `registry list|add|remove`, `search`, `info`, `plan`.
+- `src/bin/yam_publish.rs` — PC publisher: `pack`, `publish`, `release`.
 - `src/bin/yam_sign_update.rs` — update signing tool.
 - `src/lib.rs` — library root.
 - `src/v2/` — package manager: `mod.rs`, `core.rs` (includes `manager.rs` via

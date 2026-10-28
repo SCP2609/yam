@@ -33,18 +33,10 @@ yam [ГЛОБАЛЬНЫЕ ФЛАГИ] <команда> [аргументы]
 
 ## Пакеты
 
-### `pack <source> -o <файл>`
-
-Собирает `.yampkg` из каталога с `yam.yaml` для платформы из `--platform`.
-`-o`/`--output` обязателен. При успехе ничего не печатает. Единственная
-команда, которая не открывает базу состояния. Эксклюзивный `flock` на
-`$YAM_RUN/yam.lock` берут только `install`, `remove` и `repair`; остальные
-команды открывают базу без блокировки. Формат источника и артефакта —
-[PACKAGING.md](PACKAGING.md).
-
-```sh
-yam --platform yandexmicro pack ./my-package -o my-package.yampkg
-```
+Пакеты `.yampkg` собирает PC-инструмент `yam-publish pack`, а не `yam`; см.
+[PACKAGING.md](PACKAGING.md) и [PUBLISHING.md](PUBLISHING.md). Эксклюзивный
+`flock` на `$YAM_RUN/yam.lock` берут только `install`, `remove` и `repair`;
+остальные команды открывают базу без блокировки.
 
 ### `install <пакет> [-y|--yes]`
 
