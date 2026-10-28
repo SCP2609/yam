@@ -5,7 +5,8 @@ use ed25519_dalek::{pkcs8::DecodePrivateKey, Signer, SigningKey};
 use reqwest::{blocking::Client, header::HeaderValue};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::{fs, path::PathBuf, process::Command, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
+use yam::v2::{Manager, PlatformProfile};
 
 const DEFAULT_UPLOAD_URL: &str = "https://repo.yse.wtf/api/v2/upload";
 
@@ -31,15 +32,15 @@ enum CommandKind {
 
 #[derive(Args, Clone)]
 struct PackArgs {
-    /// Host YAM executable; build it locally with `cargo build --bin yam`.
-    #[arg(long, env = "YAM_BIN", default_value = "yam")]
-    yam: PathBuf,
     /// Directory containing yam.yaml.
     #[arg(long, default_value = ".")]
     source: PathBuf,
-    /// Platform ID from platforms/*.yaml.
-    #[arg(long)]
-    target: String,
+    /// Platform ID from the profiles directory.
+    #[arg(long, env = "YAM_PLATFORM")]
+    platform: String,
+    /// Directory containing platform YAML profiles.
+    #[arg(long, env = "YAM_PROFILES", default_value = "platforms")]
+    profiles: PathBuf,
     /// Destination .yampkg path.
     #[arg(short, long)]
     output: PathBuf,
@@ -98,7 +99,7 @@ fn main() -> Result<()> {
             publish(&PublishArgs {
                 artifact: args.pack.output.clone(),
                 source: args.pack.source,
-                target: args.pack.target,
+                target: args.pack.platform,
                 upload_url: args.upload_url,
                 token: args.token,
                 key: args.key,
@@ -108,17 +109,8 @@ fn main() -> Result<()> {
 }
 
 fn pack(args: &PackArgs) -> Result<()> {
-    let status = Command::new(&args.yam)
-        .args(["--platform", &args.target, "pack"])
-        .arg(&args.source)
-        .args(["--output"])
-        .arg(&args.output)
-        .status()
-        .with_context(|| format!("run {}", args.yam.display()))?;
-    if !status.success() {
-        bail!("yam pack failed with {status}")
-    }
-    Ok(())
+    let profile = PlatformProfile::load(&args.profiles, &args.platform)?;
+    Manager::pack(&args.source, &profile, &args.output)
 }
 
 fn publish(args: &PublishArgs) -> Result<()> {

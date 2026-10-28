@@ -20,7 +20,7 @@ files:
 
 ```sh
 cargo build --release --target aarch64-unknown-linux-musl
-yam --platform yandexmicro pack . --output hello.yampkg
+yam-publish --platform yandexmicro pack --source . --output hello.yampkg
 ```
 
 `.yampkg` — архив `tar.zst`. YAM сам создаёт `MANIFEST.yaml` и хеши файлов.

@@ -9,8 +9,42 @@ permissions:
   contents: write
 
 jobs:
+  publisher-macos:
+    name: Build yam-publish for macOS ARM64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build publisher
+        run: |
+          cargo build --release --locked --bin yam-publish
+          mkdir dist
+          cp target/release/yam-publish dist/yam-publish-aarch64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yam-publish-aarch64-apple-darwin
+          path: dist/yam-publish-aarch64-apple-darwin
+          if-no-files-found: error
+  publisher-windows:
+    name: Build yam-publish for Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build publisher
+        shell: pwsh
+        run: |
+          cargo build --release --locked --bin yam-publish
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/yam-publish.exe dist/yam-publish-x86_64-pc-windows-msvc.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yam-publish-x86_64-pc-windows-msvc.exe
+          path: dist/yam-publish-x86_64-pc-windows-msvc.exe
+          if-no-files-found: error
   release:
-    name: Build speaker CLI and publish release
+    name: Build and publish release
+    needs: [publisher-macos, publisher-windows]
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
@@ -37,28 +71,66 @@ jobs:
           cargo fmt --check
           cargo test --locked
           sh -n install.sh
-      - name: Build AArch64 musl speaker CLI
-        run: >-
-          docker run --rm
-          -e YAM_UPDATE_PUBLIC_KEY
-          -v "$GITHUB_WORKSPACE":/home/rust/src
-          -w /home/rust/src
-          messense/rust-musl-cross:aarch64-musl
-          cargo build --release --locked --bin yam
+      - name: Download PC publisher assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: yam-publish-*
+          path: dist
+          merge-multiple: true
+      - name: Build speaker CLI and Linux publisher assets
+        run: |
+          docker run --rm \
+            -e YAM_UPDATE_PUBLIC_KEY \
+            -v "$GITHUB_WORKSPACE":/home/rust/src \
+            -w /home/rust/src \
+            messense/rust-musl-cross:aarch64-musl \
+            cargo build --release --locked --bin yam --bin yam-publish
+          docker run --rm \
+            -e YAM_UPDATE_PUBLIC_KEY \
+            -v "$GITHUB_WORKSPACE":/home/rust/src \
+            -w /home/rust/src \
+            messense/rust-musl-cross:armv7-musleabihf \
+            cargo build --release --locked --bin yam --bin yam-publish
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/home/rust/src \
+            -w /home/rust/src \
+            messense/rust-musl-cross:x86_64-musl \
+            cargo build --release --locked --bin yam-publish
       - name: Create release
         run: |
           test -n "$YAM_UPDATE_PUBLIC_KEY" || { echo "YAM_UPDATE_PUBLIC_KEY repository variable is required" >&2; exit 1; }
           test -n "$YAM_UPDATE_SIGNING_KEY" || { echo "YAM_UPDATE_SIGNING_KEY repository secret is required" >&2; exit 1; }
-          mkdir dist
-          cp target/aarch64-unknown-linux-musl/release/yam dist/yam-aarch64-unknown-linux-musl
-          chmod 0755 dist/yam-aarch64-unknown-linux-musl
-          sha256=$(sha256sum dist/yam-aarch64-unknown-linux-musl | awk '{print $1}')
-          size=$(stat --printf='%s' dist/yam-aarch64-unknown-linux-musl)
-          artifact="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/yam-aarch64-unknown-linux-musl"
-          jq -nc --arg version "${{ steps.version.outputs.version }}" --arg artifact "$artifact" --arg sha256 "$sha256" --argjson size "$size" \
-            '{format:1,version:$version,target:"aarch64-unknown-linux-musl",artifact:$artifact,sha256:$sha256,size:$size}' > dist/yam-update.json
-          cargo run --quiet --locked --bin yam-sign-update -- --key "$YAM_UPDATE_SIGNING_KEY" dist/yam-update.json dist/yam-update.json.sig
-          (cd dist && sha256sum yam-aarch64-unknown-linux-musl > SHA256SUMS)
+          mkdir -p dist
+          for target in aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf; do
+            asset="yam-$target"
+            cp "target/$target/release/yam" "dist/$asset"
+            cp "target/$target/release/yam-publish" "dist/yam-publish-$target"
+            chmod 0755 "dist/$asset"
+            chmod 0755 "dist/yam-publish-$target"
+            sha256=$(sha256sum "dist/$asset" | awk '{print $1}')
+            size=$(stat --printf='%s' "dist/$asset")
+            artifact="${{ github.server_url }}/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag }}/$asset"
+            manifest="dist/yam-update-$target.json"
+            jq -nc --arg version "${{ steps.version.outputs.version }}" --arg target "$target" --arg artifact "$artifact" --arg sha256 "$sha256" --argjson size "$size" \
+              '{format:1,version:$version,target:$target,artifact:$artifact,sha256:$sha256,size:$size}' > "$manifest"
+            cargo run --quiet --locked --bin yam-sign-update -- --key "$YAM_UPDATE_SIGNING_KEY" "$manifest" "$manifest.sig"
+          done
+          cp target/x86_64-unknown-linux-musl/release/yam-publish dist/yam-publish-x86_64-unknown-linux-musl
+          chmod 0755 dist/yam-publish-x86_64-unknown-linux-musl
+          cp dist/yam-update-aarch64-unknown-linux-musl.json dist/yam-update.json
+          cp dist/yam-update-aarch64-unknown-linux-musl.json.sig dist/yam-update.json.sig
+          (cd dist && sha256sum \
+            yam-aarch64-unknown-linux-musl yam-armv7-unknown-linux-musleabihf \
+            yam-publish-x86_64-unknown-linux-musl yam-publish-aarch64-unknown-linux-musl \
+            yam-publish-armv7-unknown-linux-musleabihf yam-publish-aarch64-apple-darwin \
+            yam-publish-x86_64-pc-windows-msvc.exe > SHA256SUMS)
           gh release create "${{ steps.version.outputs.tag }}" \
-            dist/yam-aarch64-unknown-linux-musl dist/yam-update.json dist/yam-update.json.sig dist/SHA256SUMS \
+            dist/yam-aarch64-unknown-linux-musl dist/yam-armv7-unknown-linux-musleabihf \
+            dist/yam-publish-x86_64-unknown-linux-musl dist/yam-publish-aarch64-unknown-linux-musl \
+            dist/yam-publish-armv7-unknown-linux-musleabihf dist/yam-publish-aarch64-apple-darwin \
+            dist/yam-publish-x86_64-pc-windows-msvc.exe \
+            dist/yam-update.json dist/yam-update.json.sig \
+            dist/yam-update-aarch64-unknown-linux-musl.json dist/yam-update-aarch64-unknown-linux-musl.json.sig \
+            dist/yam-update-armv7-unknown-linux-musleabihf.json dist/yam-update-armv7-unknown-linux-musleabihf.json.sig \
+            dist/SHA256SUMS \
             --title "YAM ${{ steps.version.outputs.version }}" --generate-notes

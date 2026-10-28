@@ -78,9 +78,6 @@ try {
         $Platform = Get-DetectedPlatform $serial
         Write-Host "Определена платформа: $Platform"
     }
-    if ($Platform -in @("mango", "jbl_link_music")) {
-        throw "Профиль $Platform использует 32-битный ARM; установщик публикует только aarch64 yam."
-    }
     if ($RemoveOld) {
         if ($deviceRoot -eq "/data/quazar/yam") { throw "YAM_ROOT не может указывать на legacy-каталог с -RemoveOld." }
         $legacyCleanup = @'
@@ -100,7 +97,7 @@ rm -rf "$legacy"
         & adb -s $serial shell $legacyCleanup | Out-Null
         Write-Host "Удалены legacy yamd и его данные из /data/quazar/yam."
     }
-    $asset = "yam-aarch64-unknown-linux-musl"
+    $asset = if ($Platform -in @("mango", "jbl_link_music")) { "yam-armv7-unknown-linux-musleabihf" } else { "yam-aarch64-unknown-linux-musl" }
     $checksums = Join-Path $tmp "SHA256SUMS"
     $binary = Join-Path $tmp $asset
     Invoke-WebRequest -Uri "$releaseUrl/SHA256SUMS" -OutFile $checksums

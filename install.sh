@@ -25,13 +25,6 @@ if [ "$REMOVE_OLD" -eq 1 ] && [ "$DEVICE_ROOT" = /data/quazar/yam ]; then
   exit 2
 fi
 
-case "$PLATFORM" in
-  mango|jbl_link_music)
-    echo "Профиль $PLATFORM использует 32-битный ARM; установщик публикует только aarch64 yam." >&2
-    exit 3
-    ;;
-esac
-
 TMPDIR_INSTALL=$(mktemp -d "${TMPDIR:-/tmp}/yam.XXXXXX")
 trap 'rm -rf "$TMPDIR_INSTALL"' EXIT HUP INT TERM
 
@@ -141,6 +134,11 @@ if [ -z "$PLATFORM" ]; then
   echo "Определена платформа: $PLATFORM" >&2
 fi
 
+case "$PLATFORM" in
+  mango|jbl_link_music) ASSET=yam-armv7-unknown-linux-musleabihf ;;
+  *) ASSET=yam-aarch64-unknown-linux-musl ;;
+esac
+
 if [ "$REMOVE_OLD" -eq 1 ]; then
   adb -s "$DEVICE" shell 'set -eu
     legacy=/data/quazar/yam
@@ -157,7 +155,6 @@ if [ "$REMOVE_OLD" -eq 1 ]; then
   echo 'Удалены legacy yamd и его данные из /data/quazar/yam.' >&2
 fi
 
-ASSET=yam-aarch64-unknown-linux-musl
 download "$RELEASE_URL/SHA256SUMS" "$TMPDIR_INSTALL/SHA256SUMS"
 download "$RELEASE_URL/$ASSET" "$TMPDIR_INSTALL/$ASSET"
 verify "$TMPDIR_INSTALL/$ASSET"

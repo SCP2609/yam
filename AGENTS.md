@@ -70,7 +70,7 @@ Before committing, require a clean `git diff --check`. Never commit `target/`.
 - Source metadata is `yam.yaml`; package artifacts are `.yampkg` files.
 - A `.yampkg` is a `tar.zst` archive containing root `MANIFEST.yaml`, `files/`
   and optional `SOURCE`. Do not revive ZIP, `.yap`, or `plugin.toml` for v2.
-- `yam pack --target <platform>` generates the artifact manifest from source
+- `yam-publish pack --platform <platform>` generates the artifact manifest from source
   metadata. It expands only `$YAM_TARGET` and `$YAM_TRIPLE` in `files` paths.
 - A generated manifest contains exactly one target, hashes every payload file,
   and records provenance. It does not retain the source `files` mapping.

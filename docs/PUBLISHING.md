@@ -17,11 +17,11 @@
 ```sh
 git clone https://github.com/nyakokitsu/yam.git
 cd yam
-cargo build --release --locked --bin yam --bin yam-publish
+cargo build --release --locked --bin yam-publish
 ```
 
-`yam` здесь запускается на ПК только для создания `.yampkg`. Он не является
-сборкой для колонки.
+`yam-publish` — PC-инструмент. Он создаёт `.yampkg`, подписывает публикацию и
+не устанавливается на колонку.
 
 ## 1. Создайте namespace и token
 
@@ -85,7 +85,9 @@ cargo build --release --target aarch64-unknown-linux-musl
 ## 3. Сначала проверьте архив локально
 
 ```sh
-./target/release/yam --platform yandexmini_2 pack ../my-player \
+./target/release/yam-publish pack --platform yandexmini_2 \
+  --profiles platforms \
+  --source ../my-player \
   --output ../my-player/dist/player-yandexmini_2.yampkg
 
 ./target/release/yam --platform yandexmini_2 --root /tmp/yam-test-player \
@@ -93,14 +95,14 @@ cargo build --release --target aarch64-unknown-linux-musl
 ./target/release/yam --platform yandexmini_2 --root /tmp/yam-test-player doctor
 ```
 
-`yam pack` создаёт `MANIFEST.yaml` и SHA-256 для каждого файла. Не распаковывайте
+`yam-publish pack` создаёт `MANIFEST.yaml` и SHA-256 для каждого файла. Не распаковывайте
 и не меняйте полученный `.yampkg`: после изменения hashes больше не совпадут.
 
 ## 4. Сборка и публикация одной командой
 
 В репозитории YAM есть PC-инструмент `yam-publish`. Он:
 
-1. запускает локальный `yam pack`;
+1. создаёт `.yampkg` из `yam.yaml`;
 2. читает имя и версию из `yam.yaml`;
 3. считает SHA-256 архива;
 4. подписывает `(name, version, target, sha256)` вашим Ed25519 key;
@@ -110,9 +112,9 @@ cargo build --release --target aarch64-unknown-linux-musl
 
 ```sh
 ./target/release/yam-publish release \
-  --yam ./target/release/yam \
   --source ../my-player \
-  --target yandexmini_2 \
+  --platform yandexmini_2 \
+  --profiles platforms \
   --output ../my-player/dist/player-yandexmini_2.yampkg \
   --token "$YAM_PUBLISH_TOKEN" \
   --key "$YAM_AUTHOR_KEY_FILE"

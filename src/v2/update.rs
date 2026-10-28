@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 use std::{fs, time::Duration};
 
 const RELEASES_API: &str = "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100";
-const MANIFEST_ASSET: &str = "yam-update.json";
 
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -37,9 +36,7 @@ pub enum UpdateResult {
 }
 
 pub fn apply() -> Result<UpdateResult> {
-    if std::env::consts::OS != "linux" || std::env::consts::ARCH != "aarch64" {
-        bail!("самообновление доступно только для сборки колонки aarch64 Linux")
-    }
+    let target = update_target()?;
     let key = update_key()?;
     let client = Client::builder()
         .timeout(Duration::from_secs(60))
@@ -55,8 +52,10 @@ pub fn apply() -> Result<UpdateResult> {
             !release.draft && !release.prerelease && release.tag_name.starts_with("yam-v")
         })
         .context("нет опубликованного релиза YAM для колонки")?;
-    let manifest_url = asset_url(&release, MANIFEST_ASSET)?;
-    let signature_url = asset_url(&release, "yam-update.json.sig")?;
+    let manifest_name = format!("yam-update-{target}.json");
+    let signature_name = format!("{manifest_name}.sig");
+    let manifest_url = asset_url(&release, &manifest_name)?;
+    let signature_url = asset_url(&release, &signature_name)?;
     let manifest_bytes = client
         .get(manifest_url)
         .send()?
@@ -70,7 +69,7 @@ pub fn apply() -> Result<UpdateResult> {
         .text()?;
     verify(&key, &manifest_bytes, signature.trim())?;
     let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
-    if manifest.format != 1 || manifest.target != "aarch64-unknown-linux-musl" {
+    if manifest.format != 1 || manifest.target != target {
         bail!("некорректный манифест обновления")
     }
     if manifest.version == env!("CARGO_PKG_VERSION") {
@@ -104,6 +103,14 @@ pub fn apply() -> Result<UpdateResult> {
     }
     fs::rename(staged, &executable)?;
     Ok(UpdateResult::Updated(manifest.version))
+}
+
+fn update_target() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "aarch64") => Ok("aarch64-unknown-linux-musl"),
+        ("linux", "arm") => Ok("armv7-unknown-linux-musleabihf"),
+        _ => bail!("самообновление доступно только для сборок YAM под Linux ARM"),
+    }
 }
 
 fn asset_url(release: &Release, name: &str) -> Result<String> {

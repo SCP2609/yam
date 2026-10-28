@@ -31,11 +31,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Pack {
-        source: PathBuf,
-        #[arg(short, long)]
-        output: PathBuf,
-    },
     Install {
         package: String,
         #[arg(short = 'y', long)]
@@ -103,166 +98,150 @@ enum RegistryCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let profile = PlatformProfile::load(&cli.profiles, &cli.platform)?;
+    let root = cli.root.unwrap_or_else(|| profile.paths.root.clone());
+    let mut manager = Manager::open(root, profile)?;
     match cli.command {
-        Command::Pack { source, output } => Manager::pack(&source, &profile, &output),
-        command => {
-            let root = cli.root.unwrap_or_else(|| profile.paths.root.clone());
-            let mut manager = Manager::open(root, profile)?;
-            match command {
-                Command::Install { package, yes } => {
-                    let manifest = if Path::new(&package).is_file() {
-                        manager.install(Path::new(&package), yes)?
-                    } else {
-                        let (name, version) = split_package_version(&package)?;
-                        let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
-                        install_registry_graph(&mut manager, &selected, name, version, yes)?
-                    };
-                    println!(
-                        "Installed {} {} for {}.",
-                        manifest.name, manifest.version, manifest.target
-                    );
+        Command::Install { package, yes } => {
+            let manifest = if Path::new(&package).is_file() {
+                manager.install(Path::new(&package), yes)?
+            } else {
+                let (name, version) = split_package_version(&package)?;
+                let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+                install_registry_graph(&mut manager, &selected, name, version, yes)?
+            };
+            println!(
+                "Installed {} {} for {}.",
+                manifest.name, manifest.version, manifest.target
+            );
+        }
+        Command::Remove { name } => {
+            manager.remove(&name)?;
+            println!("Removed {name}.");
+        }
+        Command::List => {
+            for package in manager.list()? {
+                println!("{}\t{}\t{}", package.name, package.version, package.target);
+            }
+        }
+        Command::Files { name } => {
+            for path in manager.files(&name)? {
+                println!("{path}");
+            }
+        }
+        Command::Which { path } => match manager.which(&path)? {
+            Some(package) => println!("{package}"),
+            None => bail!("{path} is not owned by a YAM package"),
+        },
+        Command::Doctor => {
+            let problems = manager.doctor()?;
+            if problems.is_empty() {
+                println!("Состояние пакетов в порядке.");
+            } else {
+                for problem in problems {
+                    eprintln!("problem: {problem}");
                 }
-                Command::Remove { name } => {
-                    manager.remove(&name)?;
-                    println!("Removed {name}.");
-                }
-                Command::List => {
-                    for package in manager.list()? {
-                        println!("{}\t{}\t{}", package.name, package.version, package.target);
-                    }
-                }
-                Command::Files { name } => {
-                    for path in manager.files(&name)? {
-                        println!("{path}");
-                    }
-                }
-                Command::Which { path } => match manager.which(&path)? {
-                    Some(package) => println!("{package}"),
-                    None => bail!("{path} is not owned by a YAM package"),
-                },
-                Command::Doctor => {
-                    let problems = manager.doctor()?;
-                    if problems.is_empty() {
-                        println!("Состояние пакетов в порядке.");
-                    } else {
-                        for problem in problems {
-                            eprintln!("problem: {problem}");
-                        }
-                        bail!("doctor found inconsistencies")
-                    }
-                }
-                Command::Repair => {
-                    let repaired = manager.repair()?;
-                    if repaired.is_empty() {
-                        println!("Nothing to repair.");
-                    } else {
-                        for path in repaired {
-                            println!("Repaired {path}.");
-                        }
-                    }
-                }
-                Command::Update => match update::apply()? {
-                    UpdateResult::Current(version) => {
-                        println!("Уже установлена актуальная версия {version}.")
-                    }
-                    UpdateResult::Updated(version) => println!("Установлено обновление {version}."),
-                },
-                Command::Entware { command } => match command {
-                    EntwareCommand::Status => println!(
-                        "{}",
-                        if manager.entware_available() {
-                            "available"
-                        } else {
-                            "unavailable"
-                        }
-                    ),
-                    EntwareCommand::List => print!("{}", manager.entware_list()?),
-                },
-                Command::Service { command } => match command {
-                    ServiceCommand::List => {
-                        for service in manager.services()? {
-                            println!(
-                                "{}/{}\t{}\t{}",
-                                service.package,
-                                service.name,
-                                if service.enabled {
-                                    "enabled"
-                                } else {
-                                    "disabled"
-                                },
-                                service.spec.exec.join(" ")
-                            );
-                        }
-                    }
-                },
-                Command::Registry { command } => match command {
-                    RegistryCommand::List => {
-                        for (name, entry) in
-                            registry::load_config(&manager_root(&manager))?.registries
-                        {
-                            println!("{name}\t{}", entry.url);
-                        }
-                    }
-                    RegistryCommand::Add { name, url, key } => {
-                        registry::add_registry(&manager_root(&manager), &name, &url, &key)?;
-                        println!("Added registry {name}.");
-                    }
-                    RegistryCommand::Remove { name } => {
-                        registry::remove_registry(&manager_root(&manager), &name)?;
-                        println!("Removed registry {name}.");
-                    }
-                },
-                Command::Search { query } => {
-                    let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
-                    for package in
-                        registry::catalogue(&selected)?
-                            .packages
-                            .into_iter()
-                            .filter(|entry| {
-                                entry.name.contains(&query)
-                                    || entry.summary.to_lowercase().contains(&query.to_lowercase())
-                                    || entry
-                                        .keywords
-                                        .iter()
-                                        .any(|keyword| keyword.contains(&query))
-                            })
-                    {
-                        println!("{}\t{}\t{}", package.name, package.latest, package.summary);
-                    }
-                }
-                Command::Info { name } => {
-                    let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&registry::package_index(&selected, &name)?)?
-                    );
-                }
-                Command::Plan { package } => {
-                    let (name, version) = split_package_version(&package)?;
-                    let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
-                    let installed = manager.installed_snapshot()?;
-                    let mut source = registry::LiveSource::new(&selected);
-                    let packages = registry::resolve_with(
-                        &mut source,
-                        name,
-                        version,
-                        manager.profile(),
-                        &installed,
-                    )?;
-                    for package in packages {
-                        println!(
-                            "{}\t{}\t{}",
-                            package.name, package.version, package.artifact.url
-                        );
-                    }
-                }
-                Command::Pack { .. } => {
-                    unreachable!()
+                bail!("doctor found inconsistencies")
+            }
+        }
+        Command::Repair => {
+            let repaired = manager.repair()?;
+            if repaired.is_empty() {
+                println!("Nothing to repair.");
+            } else {
+                for path in repaired {
+                    println!("Repaired {path}.");
                 }
             }
-            Ok(())
+        }
+        Command::Update => match update::apply()? {
+            UpdateResult::Current(version) => {
+                println!("Уже установлена актуальная версия {version}.")
+            }
+            UpdateResult::Updated(version) => println!("Установлено обновление {version}."),
+        },
+        Command::Entware { command } => match command {
+            EntwareCommand::Status => println!(
+                "{}",
+                if manager.entware_available() {
+                    "available"
+                } else {
+                    "unavailable"
+                }
+            ),
+            EntwareCommand::List => print!("{}", manager.entware_list()?),
+        },
+        Command::Service { command } => match command {
+            ServiceCommand::List => {
+                for service in manager.services()? {
+                    println!(
+                        "{}/{}\t{}\t{}",
+                        service.package,
+                        service.name,
+                        if service.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        service.spec.exec.join(" ")
+                    );
+                }
+            }
+        },
+        Command::Registry { command } => match command {
+            RegistryCommand::List => {
+                for (name, entry) in registry::load_config(&manager_root(&manager))?.registries {
+                    println!("{name}\t{}", entry.url);
+                }
+            }
+            RegistryCommand::Add { name, url, key } => {
+                registry::add_registry(&manager_root(&manager), &name, &url, &key)?;
+                println!("Added registry {name}.");
+            }
+            RegistryCommand::Remove { name } => {
+                registry::remove_registry(&manager_root(&manager), &name)?;
+                println!("Removed registry {name}.");
+            }
+        },
+        Command::Search { query } => {
+            let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+            for package in registry::catalogue(&selected)?
+                .packages
+                .into_iter()
+                .filter(|entry| {
+                    entry.name.contains(&query)
+                        || entry.summary.to_lowercase().contains(&query.to_lowercase())
+                        || entry
+                            .keywords
+                            .iter()
+                            .any(|keyword| keyword.contains(&query))
+                })
+            {
+                println!("{}\t{}\t{}", package.name, package.latest, package.summary);
+            }
+        }
+        Command::Info { name } => {
+            let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&registry::package_index(&selected, &name)?)?
+            );
+        }
+        Command::Plan { package } => {
+            let (name, version) = split_package_version(&package)?;
+            let selected = registry::registry(&manager_root(&manager), &cli.registry)?;
+            let installed = manager.installed_snapshot()?;
+            let mut source = registry::LiveSource::new(&selected);
+            let packages =
+                registry::resolve_with(&mut source, name, version, manager.profile(), &installed)?;
+            for package in packages {
+                println!(
+                    "{}\t{}\t{}",
+                    package.name, package.version, package.artifact.url
+                );
+            }
         }
     }
+    Ok(())
 }
 fn manager_root(manager: &Manager) -> PathBuf {
     manager.root().to_path_buf()

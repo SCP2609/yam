@@ -11,9 +11,8 @@ ARTIFACT=${3:-"$SOURCE/dist/package-$TARGET.yampkg"}
 
 mkdir -p "$(dirname "$ARTIFACT")"
 ./target/release/yam-publish release \
-  --yam ./target/release/yam \
   --source "$SOURCE" \
-  --target "$TARGET" \
+  --platform "$TARGET" \
   --output "$ARTIFACT" \
   --token "$YAM_PUBLISH_TOKEN" \
   --key "$YAM_AUTHOR_KEY_FILE"
