@@ -18,6 +18,12 @@ curl -fsSL https://hackalice.me/install.sh | sh
 irm https://hackalice.me/install.ps1 | iex
 ```
 
+**Альтернативная ссылка** (если короткий URL ещё обновляется):
+
+```powershell
+irm https://raw.githubusercontent.com/nyakokitsu/yam/main/install.ps1 | iex
+```
+
 Установщик подключается к колонке через ADB. Публикуется только `yam` для
 `aarch64-unknown-linux-musl`; десктопных сборок нет. Платформа определяется по
 модели и Device Tree. При необходимости её можно задать явно:
