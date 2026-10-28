@@ -12,7 +12,7 @@
 curl -fsSL https://hackalice.me/install.sh | sh
 ```
 
-**Альтернативная ссылка** (если короткий URL ещё обновляется):
+**Альтернативная ссылка для Linux / macOS** (если короткий URL ещё обновляется):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/nyakokitsu/yam/main/install.sh | sh
@@ -24,7 +24,7 @@ curl -fsSL https://raw.githubusercontent.com/nyakokitsu/yam/main/install.sh | sh
 irm https://hackalice.me/install.ps1 | iex
 ```
 
-**Альтернативная ссылка** (если короткий URL ещё обновляется):
+**Альтернативная ссылка для Windows PowerShell** (если короткий URL ещё обновляется):
 
 ```powershell
 irm https://raw.githubusercontent.com/nyakokitsu/yam/main/install.ps1 | iex
