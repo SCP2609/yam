@@ -185,7 +185,7 @@ export YAM_ROOT='$deviceRoot'
 exec '$deviceRoot/bin/yam' "`$@"
 "@
     $runnerPath = Join-Path $tmp "yam-run"
-    [IO.File]::WriteAllText($runnerPath, $runner, [Text.Encoding]::ASCII)
+    [IO.File]::WriteAllText($runnerPath, (($runner -replace "`r`n", "`n") + "`n"), [Text.Encoding]::ASCII)
     & adb -s $serial push $runnerPath "$deviceRoot/bin/yam-run.new" | Out-Null
     & adb -s $serial shell "chmod 0755 '$deviceRoot/bin/yam-run.new'; mv '$deviceRoot/bin/yam-run.new' '$deviceRoot/bin/yam-run'; test -s '$deviceRoot/bin/yam-run'" | Out-Null
     $yamCommand = "$deviceRoot/bin/yam-run"
@@ -202,7 +202,7 @@ case "`${1:-}" in
     ;;
 esac
 "@
-        $bootScript64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootScript))
+        $bootScript64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((($bootScript -replace "`r`n", "`n") + "`n")))
         $bootCommand = "set -eu; mount -o remount,rw /; trap 'mount -o remount,ro /' EXIT; if [ -e /usr/bin/yam ] && { [ ! -L /usr/bin/yam ] || [ `$(readlink /usr/bin/yam) != '$deviceRoot/bin/yam-run' ]; }; then exit 1; fi; ln -sfn '$deviceRoot/bin/yam-run' /usr/bin/yam; echo '$bootScript64' | base64 -d > /etc/init.d/S99yam; chmod 0755 /etc/init.d/S99yam"
         & adb -s $serial shell $bootCommand | Out-Null
         $yamCommand = "yam"
