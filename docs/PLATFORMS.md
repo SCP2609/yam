@@ -31,7 +31,8 @@ Entware или возможность установки системных фа
 Автоматический boot hook (`boot_hook`, `/etc/init.d/S99yam`) задан только в
 `platforms/yandexmicro.yaml`, и `install.sh` настраивает автообновление при
 загрузке только для него. На остальных платформах обновление при
-необходимости запускайте вручную: `yam update`.
+необходимости запускайте вручную через обёртку: `$YAM_ROOT/bin/yam-run update`
+(по умолчанию `/data/yam/bin/yam-run update`).
 
 `install.sh` определяет платформу по `getprop`/device-tree; при неудаче
 задайте `YAM_PLATFORM` явно. `yandexplum` автоопределением не выбирается

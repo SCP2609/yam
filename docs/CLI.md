@@ -20,13 +20,15 @@ yam [ГЛОБАЛЬНЫЕ ФЛАГИ] <команда> [аргументы]
 профиль загружается до разбора команды.
 
 На колонках установщик кладёт обёртку `$YAM_ROOT/bin/yam-run` (по умолчанию
-`/data/yam/bin/yam-run`), которая экспортирует `YAM_PLATFORM` и
-`YAM_PROFILES=$YAM_ROOT/platforms` и запускает `$YAM_ROOT/bin/yam`. На Micro
-обёртка ещё и доступна как `/usr/bin/yam`, так что там достаточно `yam list`.
-На остальных платформах укажите флаги сами:
+`/data/yam/bin/yam-run`), которая экспортирует `YAM_PLATFORM`,
+`YAM_PROFILES=$YAM_ROOT/platforms` и `YAM_ROOT` и запускает
+`$YAM_ROOT/bin/yam`. На Micro обёртка ещё и доступна как `/usr/bin/yam`, так
+что там достаточно `yam list`. На остальных платформах вызывайте обёртку по
+пути:
 
 ```sh
-yam --platform yandexmini_2 --profiles /data/yam/platforms list
+/data/yam/bin/yam-run list
+/data/yam/bin/yam-run update
 ```
 
 ## Пакеты

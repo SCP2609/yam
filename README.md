@@ -48,8 +48,10 @@ curl -fsSL https://hackalice.me/install.sh | YAM_PLATFORM=yandexmini_2 sh
 | --- | --- | --- |
 | аргумент `[версия]` или `YAM_VERSION` | `-Version` или `YAM_VERSION` | Релиз `yam-v<версия>`. По умолчанию `install.sh` берёт первый тег `yam-v*` из GitHub Releases без фильтра prerelease, `install.ps1` — первый не-draft и не-prerelease |
 | `YAM_PLATFORM` | `-Platform` или `YAM_PLATFORM` | Профиль платформы вместо автоопределения |
-| `YAM_ROOT` | `YAM_ROOT` | Каталог YAM на колонке; по умолчанию `/data/yam` |
+| `YAM_ROOT` | `YAM_ROOT` | Каталог YAM на колонке; по умолчанию `/data/yam`; абсолютный путь из символов `A-Za-z0-9 . _ -` |
 | `--remove-old` | `-RemoveOld` | Попытаться остановить legacy `yamd` и **полностью удалить** `/data/quazar/yam` |
+| `--uninstall` | `-Uninstall` | Удалить YAM из `YAM_ROOT` (по умолчанию `/data/yam`) вместе с пакетами, базой и данными; на Micro также `/usr/bin/yam` и `/etc/init.d/S99yam`. Перед удалением спрашивает подтверждение |
+| `--yes`, `-y` | `-Yes` | Не спрашивать подтверждение при удалении |
 | — | `-StationIp` | IP колонки для `adb connect` |
 
 Если ADB-устройств несколько, установщик спрашивает номер; если их нет —
@@ -59,9 +61,28 @@ IP-адрес и подключается к `<IP>:5555`. Аргументы `in
 curl -fsSL https://hackalice.me/install.sh | sh -s -- 0.2.1
 ```
 
+Удаление и передача параметров Windows-установщику:
+
+```sh
+curl -fsSL https://hackalice.me/install.sh | sh -s -- --uninstall
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://hackalice.me/install.ps1))) -Uninstall
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/nyakokitsu/yam/refs/heads/main/install.ps1))) -Uninstall -Yes
+```
+
+Обёртка `hackalice.me/install.ps1` пропускает только `-Version` и `-Uninstall`;
+`-Yes`, `-Platform`, `-StationIp` и `-RemoveOld` передавайте скрипту по прямому
+адресу из второго примера.
+
 > [!WARNING]
 > `--remove-old` выполняет `rm -rf /data/quazar/yam`: удаляются старый `yamd`,
 > все пакеты v1 и их данные. Перед запуском сделайте резервную копию.
+>
+> `--uninstall`/`-Uninstall` выполняет `rm -rf` каталога `YAM_ROOT` (по
+> умолчанию `/data/yam`): удаляются все пакеты v2, база состояния и их данные.
+> Entware (`/opt`) и каталог блокировки `/tmp/yam` не затрагиваются.
 
 ## Использование
 
@@ -76,7 +97,8 @@ yam --platform yandexmicro update
 
 Реестр `official` по умолчанию не настроен: перед `search` и установкой по
 имени добавьте его командой `yam registry add` (см. [CLI](docs/CLI.md)). На
-Micro обёртка `/usr/bin/yam` уже задаёт платформу и каталог профилей.
+Micro обёртка `/usr/bin/yam` уже задаёт платформу, каталог профилей и корень
+`YAM_ROOT`.
 
 Для локальной проверки пакета укажите отдельный каталог:
 
@@ -102,8 +124,8 @@ Lua, Quasar, веб-интерфейс и старые `.yap`/`plugin.toml` на
 На Micro установщик создаёт `/usr/bin/yam` — ссылку на обёртку
 `/data/yam/bin/yam-run` — и загрузочный скрипт `/etc/init.d/S99yam`, который
 при старте выполняет `yam update` (ошибка обновления загрузку не прерывает).
-На остальных платформах автообновления при загрузке нет: запускайте
-`yam update` вручную.
+На остальных платформах автообновления при загрузке нет: запускайте обёртку
+вручную, например `adb shell /data/yam/bin/yam-run update`.
 
 Обновление принимается только при корректной Ed25519-подписи манифеста из
 GitHub Releases; открытый ключ зашивается в бинарник при сборке. Для

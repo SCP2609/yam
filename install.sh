@@ -3,12 +3,20 @@ set -eu
 
 VERSION=${YAM_VERSION:-latest}
 REMOVE_OLD=0
+UNINSTALL=0
+YES=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --remove-old) REMOVE_OLD=1 ;;
+    --uninstall) UNINSTALL=1 ;;
+    --yes|-y) YES=1 ;;
     --help|-h)
       echo 'Использование: install.sh [версия] [--remove-old]'
+      echo '               install.sh --uninstall [--yes]'
       echo '  --remove-old  удалить legacy yamd из /data/quazar/yam'
+      echo '  --uninstall   удалить YAM из $YAM_ROOT (по умолчанию /data/yam) вместе с пакетами и данными;'
+      echo '                на yandexmicro также /usr/bin/yam и /etc/init.d/S99yam'
+      echo '  --yes, -y     не спрашивать подтверждение при --uninstall'
       exit 0
       ;;
     -*) echo "Неизвестный флаг: $1" >&2; exit 2 ;;
@@ -18,10 +26,26 @@ while [ "$#" -gt 0 ]; do
 done
 REPOSITORY=https://github.com/nyakokitsu/yam
 DEVICE_ROOT=${YAM_ROOT:-/data/yam}
+while [ "$DEVICE_ROOT" != "${DEVICE_ROOT%/}" ]; do DEVICE_ROOT=${DEVICE_ROOT%/}; done
+root_ok=1
+case "$DEVICE_ROOT" in
+  /?*) ;;
+  *) root_ok=0 ;;
+esac
+case "$DEVICE_ROOT" in *//*|*/./*|*/../*|*/.|*/..) root_ok=0 ;; esac
+case "$DEVICE_ROOT" in *[!A-Za-z0-9/._-]*) root_ok=0 ;; esac
+if [ "$root_ok" -eq 0 ]; then
+  echo "Недопустимый YAM_ROOT: '${YAM_ROOT:-}'. Нужен абсолютный путь из символов A-Za-z0-9 . _ - без компонентов . и .., не /." >&2
+  exit 2
+fi
 PLATFORM=${YAM_PLATFORM:-}
 
 if [ "$REMOVE_OLD" -eq 1 ] && [ "$DEVICE_ROOT" = /data/quazar/yam ]; then
   echo 'YAM_ROOT не может указывать на legacy-каталог при --remove-old.' >&2
+  exit 2
+fi
+if [ "$UNINSTALL" -eq 1 ] && [ "$REMOVE_OLD" -eq 1 ]; then
+  echo '--uninstall нельзя сочетать с --remove-old.' >&2
   exit 2
 fi
 
@@ -51,12 +75,6 @@ latest_tag() {
   fi | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\(yam-v[^"]*\)".*/\1/p' | head -n 1
 }
 
-case "$VERSION" in
-  latest) TAG=$(latest_tag); [ -n "$TAG" ] || { echo 'Не найден релиз канала yam-v.' >&2; exit 4; }; SOURCE_REF=main ;;
-  yam-v*) TAG="$VERSION"; SOURCE_REF="$VERSION" ;;
-  *) TAG="yam-v$VERSION"; SOURCE_REF="$TAG" ;;
-esac
-RELEASE_URL="$REPOSITORY/releases/download/$TAG"
 
 verify() {
   file=$1
@@ -93,6 +111,37 @@ device_identity() {
     | tr -d '\r' | tr '[:upper:]' '[:lower:]'
 }
 
+uninstall_script() {
+  cat <<EOF
+set -eu
+root='$DEVICE_ROOT'
+wrapper="\$root/bin/yam-run"
+link=/usr/bin/yam
+hook=/etc/init.d/S99yam
+own_root() { [ -f "\$wrapper" ] && [ ! -L "\$wrapper" ] && grep -Fqx "export YAM_PROFILES='\$root/platforms'" "\$wrapper"; }
+own_link() { [ -L "\$link" ] && [ "\$(readlink "\$link")" = "\$root/bin/yam-run" ]; }
+own_hook() { [ -f "\$hook" ] && [ ! -L "\$hook" ] && grep -Fqx "root='\$root'" "\$hook"; }
+if own_link || own_hook; then
+  mount -o remount,rw /
+  trap 'mount -o remount,ro /' EXIT
+  if own_link; then rm -f "\$link"; echo "removed \$link"; fi
+  if own_hook; then rm -f "\$hook"; echo "removed \$hook"; fi
+  mount -o remount,ro /
+  trap - EXIT
+fi
+if own_root; then
+  rm -rf "\$root"
+  echo "removed \$root"
+elif [ -e "\$root" ] || [ -L "\$root" ]; then
+  echo "no YAM wrapper in \$root (bin/yam-run); left untouched" >&2
+  exit 1
+else
+  echo "YAM is not installed in \$root"
+fi
+echo YAM-UNINSTALL-DONE
+EOF
+}
+
 detect_platform() {
   case "$DEVICE_IDENTITY" in
     *yandex,station-mini2*|*station-mini2*) printf '%s\n' yandexmini_2 ;;
@@ -122,6 +171,21 @@ if [ -z "$DEVICE" ]; then
   adb connect "$DEVICE" </dev/null >&2
   adb -s "$DEVICE" get-state </dev/null >/dev/null
 fi
+if [ "$UNINSTALL" -eq 1 ]; then
+  if [ "$YES" -eq 0 ]; then
+    printf 'Удалить YAM из %s на %s вместе со всеми пакетами и данными? [y/N] ' "$DEVICE_ROOT" "$DEVICE" >&2
+    IFS= read -r answer </dev/tty
+    case "$answer" in [Yy]|[Yy][Ee][Ss]) ;; *) echo 'Отменено.' >&2; exit 1 ;; esac
+  fi
+  output=$(adb -s "$DEVICE" shell "$(uninstall_script)" </dev/null 2>&1 | tr -d '\r')
+  printf '%s\n' "$output"
+  if ! printf '%s\n' "$output" | grep -Fxq 'YAM-UNINSTALL-DONE'; then
+    echo 'Удаление не завершилось; смотрите вывод выше.' >&2
+    exit 7
+  fi
+  echo "Удаление YAM из $DEVICE_ROOT на $DEVICE завершено." >&2
+  exit 0
+fi
 
 if [ -z "$PLATFORM" ]; then
   DEVICE_IDENTITY=$(device_identity)
@@ -138,6 +202,12 @@ case "$PLATFORM" in
   mango|jbl_link_music) ASSET=yam-armv7-unknown-linux-musleabihf ;;
   *) ASSET=yam-aarch64-unknown-linux-musl ;;
 esac
+case "$VERSION" in
+  latest) TAG=$(latest_tag); [ -n "$TAG" ] || { echo 'Не найден релиз канала yam-v.' >&2; exit 4; }; SOURCE_REF=main ;;
+  yam-v*) TAG="$VERSION"; SOURCE_REF="$VERSION" ;;
+  *) TAG="yam-v$VERSION"; SOURCE_REF="$TAG" ;;
+esac
+RELEASE_URL="$REPOSITORY/releases/download/$TAG"
 
 if [ "$REMOVE_OLD" -eq 1 ]; then
   adb -s "$DEVICE" shell 'set -eu
@@ -170,11 +240,13 @@ cat >"$TMPDIR_INSTALL/yam-run" <<EOF
 #!/bin/sh
 export YAM_PLATFORM='$PLATFORM'
 export YAM_PROFILES='$DEVICE_ROOT/platforms'
+export YAM_ROOT='$DEVICE_ROOT'
 exec '$DEVICE_ROOT/bin/yam' "\$@"
 EOF
 adb -s "$DEVICE" push "$TMPDIR_INSTALL/yam-run" "$DEVICE_ROOT/bin/yam-run.new" </dev/null >/dev/null
 adb -s "$DEVICE" shell "chmod 0755 '$DEVICE_ROOT/bin/yam-run.new'; mv '$DEVICE_ROOT/bin/yam-run.new' '$DEVICE_ROOT/bin/yam-run'; test -s '$DEVICE_ROOT/bin/yam-run'" </dev/null
 
+YAM_CMD="$DEVICE_ROOT/bin/yam-run"
 if [ "$PLATFORM" = yandexmicro ]; then
   adb -s "$DEVICE" shell "set -eu
     mount -o remount,rw /
@@ -196,9 +268,10 @@ case \"\${1:-}\" in
 esac
 HOOK
     chmod 0755 /etc/init.d/S99yam" </dev/null
+  YAM_CMD=yam
 else
-  echo "Автообновление при загрузке настроено только для yandexmicro; используйте: yam --platform $PLATFORM --profiles $DEVICE_ROOT/platforms update" >&2
+  echo "Автообновление при загрузке настроено только для yandexmicro; обновляйте вручную: adb -s $DEVICE shell '$YAM_CMD update'" >&2
 fi
 
 echo "YAM установлен на $DEVICE: $DEVICE_ROOT/bin/yam"
-echo "Пример: adb -s $DEVICE shell 'yam list'"
+echo "Пример: adb -s $DEVICE shell '$YAM_CMD list'"

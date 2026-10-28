@@ -56,8 +56,14 @@ SQLite, OTA firmware comparison at boot.
   `docs/PLATFORMS.md`, `docs/REGISTRY.md` — public documentation.
 - `install.sh` / `install.ps1` — deployment scripts. They write the Micro boot
   hook `/etc/init.d/S99yam`; `--remove-old` also removes the legacy hook and
-  `/data/quazar/yam`. Every read-write remount of `/` must restore read-only
-  via a trap.
+  `/data/quazar/yam`. `--uninstall`/`-Uninstall` removes `$YAM_ROOT` only when
+  it holds the installer-written `bin/yam-run` wrapper naming that root, plus
+  the Micro link/hook that point at it; success is reported solely by the
+  device printing `YAM-UNINSTALL-DONE`, because the stations' `adb shell` does
+  not propagate exit codes. `install.ps1` ships multi-line device scripts
+  base64-encoded (`… | base64 -d | sh`): Windows PowerShell 5.1 does not
+  escape embedded double quotes in native arguments. Every read-write remount
+  of `/` must restore read-only via a trap.
 - `.github/workflows/ci.yml`, `release.yml` — CI and release.
 
 Do not place package payloads, target binaries, registry downloads, device

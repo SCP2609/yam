@@ -2,29 +2,18 @@ param(
     [string]$Version = $(if ($env:YAM_VERSION) { $env:YAM_VERSION } else { "latest" }),
     [string]$StationIp,
     [string]$Platform = $env:YAM_PLATFORM,
-    [switch]$RemoveOld
+    [switch]$RemoveOld,
+    [switch]$Uninstall,
+    [switch]$Yes
 )
 
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 $repository = "https://github.com/nyakokitsu/yam"
 $deviceRoot = if ($env:YAM_ROOT) { $env:YAM_ROOT } else { "/data/yam" }
-if ($Version -eq "latest") {
-    $apiHeaders = @{ "User-Agent" = "YAM-installer"; "Accept" = "application/vnd.github+json" }
-    $releases = @(Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100")
-    $release = @($releases | Where-Object {
-            ($_.draft -eq $false) -and
-            ($_.prerelease -eq $false) -and
-            ($_.tag_name -like "yam-v*")
-        })[0]
-    if (-not $release) { throw "Не найден релиз канала yam-v." }
-    $tag = $release.tag_name
-    $releaseUrl = "$repository/releases/download/$tag"
-    $sourceRef = "main"
-} else {
-    $tag = if ($Version.StartsWith("yam-v")) { $Version } else { "yam-v$Version" }
-    $releaseUrl = "$repository/releases/download/$tag"
-    $sourceRef = $tag
+$deviceRoot = $deviceRoot.TrimEnd('/')
+if ($deviceRoot -notmatch '^(/[A-Za-z0-9._-]+)+$' -or (($deviceRoot -split '/') -contains '.') -or (($deviceRoot -split '/') -contains '..')) {
+    throw "Недопустимый YAM_ROOT: '$($env:YAM_ROOT)'. Нужен абсолютный путь из символов A-Za-z0-9 . _ - без компонентов . и .., не /."
 }
 
 $adb = Get-Command adb -ErrorAction SilentlyContinue
@@ -48,7 +37,7 @@ function Get-Device {
     $devices = @(& adb devices | Select-Object -Skip 1 | ForEach-Object {
         $parts = $_ -split "`t"
         if ($parts.Count -ge 2 -and $parts[1] -eq "device") { $parts[0] }
-    }) | Where-Object { $_ }
+    } | Where-Object { $_ })
     if ($devices.Count -eq 1) { return $devices[0] }
     if ($devices.Count -gt 1) {
         for ($i = 0; $i -lt $devices.Count; $i++) { Write-Host "$($i + 1)) $($devices[$i])" }
@@ -89,9 +78,68 @@ $tmp = Join-Path ([IO.Path]::GetTempPath()) ("yam-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     $serial = Get-Device
+    if ($Uninstall) {
+        if ($RemoveOld) { throw "-Uninstall нельзя сочетать с -RemoveOld." }
+        if (-not $Yes) {
+            $answer = Read-Host "Удалить YAM из $deviceRoot на $serial вместе со всеми пакетами и данными? [y/N]"
+            if ($answer -notmatch '^(y|yes)$') { throw "Отменено." }
+        }
+        $uninstallScript = @"
+set -eu
+root='$deviceRoot'
+wrapper="`$root/bin/yam-run"
+link=/usr/bin/yam
+hook=/etc/init.d/S99yam
+own_root() { [ -f "`$wrapper" ] && [ ! -L "`$wrapper" ] && grep -Fqx "export YAM_PROFILES='`$root/platforms'" "`$wrapper"; }
+own_link() { [ -L "`$link" ] && [ "`$(readlink "`$link")" = "`$root/bin/yam-run" ]; }
+own_hook() { [ -f "`$hook" ] && [ ! -L "`$hook" ] && grep -Fqx "root='`$root'" "`$hook"; }
+if own_link || own_hook; then
+  mount -o remount,rw /
+  trap 'mount -o remount,ro /' EXIT
+  if own_link; then rm -f "`$link"; echo "removed `$link"; fi
+  if own_hook; then rm -f "`$hook"; echo "removed `$hook"; fi
+  mount -o remount,ro /
+  trap - EXIT
+fi
+if own_root; then
+  rm -rf "`$root"
+  echo "removed `$root"
+elif [ -e "`$root" ] || [ -L "`$root" ]; then
+  echo "no YAM wrapper in `$root (bin/yam-run); left untouched" >&2
+  exit 1
+else
+  echo "YAM is not installed in `$root"
+fi
+echo YAM-UNINSTALL-DONE
+"@
+        $uninstallScript = ($uninstallScript -replace "`r`n", "`n") + "`n"
+        $uninstallScript64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($uninstallScript))
+        $output = (& adb -s $serial shell "echo '$uninstallScript64' | base64 -d | sh" | ForEach-Object { "$_".TrimEnd("`r") }) -join "`n"
+        Write-Host $output
+        if (($output -split "`n") -cnotcontains 'YAM-UNINSTALL-DONE') { throw "Удаление не завершилось; смотрите вывод выше." }
+        Write-Host "Удаление YAM из $deviceRoot на $serial завершено."
+        return
+    }
     if ([string]::IsNullOrWhiteSpace($Platform)) {
         $Platform = Get-DetectedPlatform $serial
         Write-Host "Определена платформа: $Platform"
+    }
+    if ($Version -eq "latest") {
+        $apiHeaders = @{ "User-Agent" = "YAM-installer"; "Accept" = "application/vnd.github+json" }
+        $releases = @(Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/nyakokitsu/yam/releases?per_page=100")
+        $release = @($releases | Where-Object {
+                ($_.draft -eq $false) -and
+                ($_.prerelease -eq $false) -and
+                ($_.tag_name -like "yam-v*")
+            })[0]
+        if (-not $release) { throw "Не найден релиз канала yam-v." }
+        $tag = $release.tag_name
+        $releaseUrl = "$repository/releases/download/$tag"
+        $sourceRef = "main"
+    } else {
+        $tag = if ($Version.StartsWith("yam-v")) { $Version } else { "yam-v$Version" }
+        $releaseUrl = "$repository/releases/download/$tag"
+        $sourceRef = $tag
     }
     if ($RemoveOld) {
         if ($deviceRoot -eq "/data/quazar/yam") { throw "YAM_ROOT не может указывать на legacy-каталог с -RemoveOld." }
@@ -109,7 +157,8 @@ if [ -f /etc/init.d/S99yam ] && grep -q "/data/quazar/yam" /etc/init.d/S99yam; t
 fi
 rm -rf "$legacy"
 '@
-        & adb -s $serial shell $legacyCleanup | Out-Null
+        $legacyCleanup64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((($legacyCleanup -replace "`r`n", "`n") + "`n")))
+        & adb -s $serial shell "echo '$legacyCleanup64' | base64 -d | sh" | Out-Null
         Write-Host "Удалены legacy yamd и его данные из /data/quazar/yam."
     }
     $asset = if ($Platform -in @("mango", "jbl_link_music")) { "yam-armv7-unknown-linux-musleabihf" } else { "yam-aarch64-unknown-linux-musl" }
@@ -132,12 +181,14 @@ rm -rf "$legacy"
 #!/bin/sh
 export YAM_PLATFORM='$Platform'
 export YAM_PROFILES='$deviceRoot/platforms'
+export YAM_ROOT='$deviceRoot'
 exec '$deviceRoot/bin/yam' "`$@"
 "@
     $runnerPath = Join-Path $tmp "yam-run"
     [IO.File]::WriteAllText($runnerPath, $runner, [Text.Encoding]::ASCII)
     & adb -s $serial push $runnerPath "$deviceRoot/bin/yam-run.new" | Out-Null
     & adb -s $serial shell "chmod 0755 '$deviceRoot/bin/yam-run.new'; mv '$deviceRoot/bin/yam-run.new' '$deviceRoot/bin/yam-run'; test -s '$deviceRoot/bin/yam-run'" | Out-Null
+    $yamCommand = "$deviceRoot/bin/yam-run"
     if ($Platform -eq "yandexmicro") {
         $bootScript = @"
 #!/bin/sh
@@ -154,11 +205,12 @@ esac
         $bootScript64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bootScript))
         $bootCommand = "set -eu; mount -o remount,rw /; trap 'mount -o remount,ro /' EXIT; if [ -e /usr/bin/yam ] && { [ ! -L /usr/bin/yam ] || [ `$(readlink /usr/bin/yam) != '$deviceRoot/bin/yam-run' ]; }; then exit 1; fi; ln -sfn '$deviceRoot/bin/yam-run' /usr/bin/yam; echo '$bootScript64' | base64 -d > /etc/init.d/S99yam; chmod 0755 /etc/init.d/S99yam"
         & adb -s $serial shell $bootCommand | Out-Null
+        $yamCommand = "yam"
     } else {
-        Write-Warning "Автообновление при загрузке настроено только для yandexmicro."
+        Write-Warning "Автообновление при загрузке настроено только для yandexmicro; обновляйте вручную: adb -s $serial shell '$yamCommand update'"
     }
     Write-Host "YAM установлен: $deviceRoot/bin/yam"
-    Write-Host "Пример: adb -s $serial shell 'yam list'"
+    Write-Host "Пример: adb -s $serial shell '$yamCommand list'"
 } finally {
     if (Test-Path $tmp) { Remove-Item -Force -Recurse $tmp }
 }
