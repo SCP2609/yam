@@ -139,7 +139,7 @@ pub(crate) fn extract_artifact(
                     limits.max_total_unpacked_bytes,
                 )?;
             }
-            set_payload_mode(&out, relative)?;
+            set_payload_mode(&out, relative, entry.header().mode()?)?;
             computed_hashes.insert(relative.to_string(), format!("{:x}", hasher.finalize()));
         } else if name == "SOURCE" {
             copy_bounded(

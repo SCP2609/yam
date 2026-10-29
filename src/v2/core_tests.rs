@@ -1,6 +1,109 @@
 use super::*;
 use tempfile::TempDir;
 
+#[cfg(unix)]
+#[test]
+fn payload_modes_preserve_execute_intent_but_not_privileged_or_writable_bits() {
+    use std::os::unix::fs::PermissionsExt;
+    let work = TempDir::new().unwrap();
+    let file = work.path().join("payload");
+    fs::write(&file, b"test").unwrap();
+    for (path, archive_mode, expected) in [
+        ("share/example.tool/bin/private", 0o755, 0o755),
+        ("share/example.tool/lib/loader.so", 0o711, 0o755),
+        ("share/example.tool/run.sh", 0o7777, 0o755),
+        ("share/example.tool/config.json", 0o6666, 0o644),
+        ("share/example.tool/readme", 0o600, 0o644),
+        ("bin/legacy-tool", 0o644, 0o755),
+        ("hooks/legacy-hook", 0o644, 0o755),
+    ] {
+        set_payload_mode(&file, path, archive_mode).unwrap();
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o7777,
+            expected,
+            "{path}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn packed_private_executable_runs_after_install_without_postinstall_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+    let work = TempDir::new().unwrap();
+    let profile = test_profile(work.path());
+    let source = work.path().join("source");
+    fs::create_dir_all(source.join("payload/bin")).unwrap();
+    fs::create_dir_all(source.join("payload/lib")).unwrap();
+    fs::write(source.join("yam.yaml"), "name: example/tool\nversion: 1.0.0\nlicense: MIT\ndescription: Private executable fixture\ntargets: [testplatform]\nfiles:\n  share/example.tool/: payload/\n").unwrap();
+    fs::write(
+        source.join("payload/bin/private-tool"),
+        "#!/bin/sh\nprintf '%s\\n' private-tool-ok\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        source.join("payload/bin/private-tool"),
+        fs::Permissions::from_mode(0o4755),
+    )
+    .unwrap();
+    fs::write(
+        source.join("payload/lib/private-loader.so"),
+        b"non-executed loader fixture",
+    )
+    .unwrap();
+    fs::set_permissions(
+        source.join("payload/lib/private-loader.so"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    fs::write(source.join("payload/config.json"), b"{}").unwrap();
+    fs::set_permissions(
+        source.join("payload/config.json"),
+        fs::Permissions::from_mode(0o666),
+    )
+    .unwrap();
+    let artifact = work.path().join("tool.yampkg");
+    Manager::pack(&source, &profile, &artifact).unwrap();
+    let root = profile.paths.root.clone();
+    let mut manager = Manager::open(root.clone(), profile).unwrap();
+    manager.install(&artifact, true).unwrap();
+    let program = root.join("share/example.tool/bin/private-tool");
+    assert_eq!(
+        fs::metadata(&program).unwrap().permissions().mode() & 0o7777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(root.join("share/example.tool/lib/private-loader.so"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o755
+    );
+    assert_eq!(
+        fs::metadata(root.join("share/example.tool/config.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o7777,
+        0o644
+    );
+    let output = Command::new(&program).output().unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8(output.stdout)
+        .unwrap()
+        .starts_with("private-tool-ok"));
+    assert_eq!(
+        manager
+            .which("share/example.tool/bin/private-tool")
+            .unwrap(),
+        Some("example/tool".into())
+    );
+    assert!(manager.doctor().unwrap().is_empty());
+    manager.remove("example/tool").unwrap();
+    assert!(!program.exists());
+}
+
 #[test]
 fn package_names_and_payload_paths_are_strict() {
     assert!(validate_name("nikita/soloist").is_ok());
