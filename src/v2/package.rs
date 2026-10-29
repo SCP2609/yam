@@ -235,6 +235,26 @@ pub(crate) fn validate_manifest(manifest: &PackageManifest) -> Result<()> {
     for (name, service) in &manifest.services {
         validate_service(name, service, &manifest.files_sha256)?;
     }
+    validate_postinstall(manifest)?;
+    Ok(())
+}
+
+fn validate_postinstall(manifest: &PackageManifest) -> Result<()> {
+    let Some(executable) = manifest.postinstall.first() else {
+        return Ok(());
+    };
+    if !executable.starts_with("bin/") {
+        bail!("postinstall executable must be a package file under bin/: {executable}")
+    }
+    validate_payload_path(executable)?;
+    if !manifest.files_sha256.contains_key(executable) {
+        bail!("postinstall executable is not in the package payload: {executable}")
+    }
+    for argument in &manifest.postinstall {
+        if argument.contains('\0') {
+            bail!("postinstall contains a NUL byte")
+        }
+    }
     Ok(())
 }
 /// Every `share/` path for a package outside `yam/` must contain a path

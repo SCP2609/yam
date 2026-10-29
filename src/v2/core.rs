@@ -96,6 +96,11 @@ pub struct PackageSource {
     pub entware: Option<EntwareRequest>,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceSpec>,
+    /// Command run after this package's payload and links are staged.
+    /// The first item is a `bin/` file from this package; remaining items
+    /// are literal arguments, never interpreted by a shell.
+    #[serde(default)]
+    pub postinstall: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -154,6 +159,8 @@ pub struct PackageManifest {
     pub entware: Option<EntwareRequest>,
     #[serde(default)]
     pub services: BTreeMap<String, ServiceSpec>,
+    #[serde(default)]
+    pub postinstall: Vec<String>,
     pub files_sha256: BTreeMap<String, String>,
 }
 

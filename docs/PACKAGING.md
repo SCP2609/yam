@@ -121,5 +121,24 @@ YAM только сохраняет декларации при установк
 
 Обязательны `name`, `version`, `license`, `description`, `targets`, `files`.
 Необязательны: `homepage`, `depends`, `recommends`, `enhances`, `provides`,
-`conflicts`, `replaces`, `permissions`, `entware`, `services`. Неизвестные
+`conflicts`, `replaces`, `permissions`, `entware`, `services`, `postinstall`. Неизвестные
 поля отвергаются.
+
+## Postinstall
+
+После успешной распаковки и создания ссылок пакет может выполнить один
+`postinstall` hook. Это массив аргументов, не shell-строка: первый элемент
+обязательно должен ссылаться на файл пакета в `bin/`.
+
+```yaml
+files:
+  bin/postinstall: scripts/postinstall.sh
+postinstall: [bin/postinstall, --configure]
+```
+
+Hook запускается от root с таймаутом 60 секунд. Он получает `YAM_ROOT`,
+`YAM_PKG`, `YAM_ETC`, `YAM_VAR`, `YAM_RUN` и `YAM_PLATFORM`; рабочий каталог —
+директория установленной версии пакета. При ненулевом коде завершения или
+таймауте YAM откатывает установку и её ссылки. Скрипт должен быть идемпотентным;
+изменения вне файлового состояния пакета (например, в `YAM_VAR`) не могут быть
+автоматически отменены.
