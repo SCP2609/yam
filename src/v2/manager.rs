@@ -210,6 +210,7 @@ impl Manager {
             permissions: source.permissions,
             entware: source.entware,
             services: source.services,
+            postinstall: source.postinstall,
             files_sha256: hashes,
         };
         validate_manifest(&manifest)?;
@@ -338,6 +339,11 @@ impl Manager {
         // place below.
         let files_dir = staging.join("files");
         let marker = self.transaction_marker_path();
+        // Keep the hook context independent of the SQLite transaction's
+        // mutable borrow of `self` below.
+        let hook_root = self.root.clone();
+        let hook_profile = self.profile.clone();
+        let hook_has_entware = self.entware_available();
         let transaction = self.db.transaction()?;
         let existing: Option<(String, String)> = transaction
             .query_row(
@@ -548,6 +554,27 @@ impl Manager {
             )));
         }
 
+        if let Err(error) = Self::run_postinstall(
+            manifest,
+            &destination,
+            &hook_root,
+            &hook_profile,
+            hook_has_entware,
+        ) {
+            let rollback_errors = unwind(undo);
+            drop(transaction);
+            self.prune_empty_ancestors(&destination, &self.root.join("pkgs"));
+            if rollback_errors.is_empty() {
+                let _ = fs::remove_file(&marker);
+                return Err(error.context(format!("postinstall failed for {}", manifest.name)));
+            }
+            return Err(error.context(format!(
+                "postinstall failed for {}; disk rollback left problems behind, run `yam repair`: {}",
+                manifest.name,
+                rollback_errors.join("; ")
+            )));
+        }
+
         transaction.commit()?;
         for link in &removed_stale_links {
             let floor = self.common_tree_floor(link);
@@ -565,6 +592,54 @@ impl Manager {
         }
         fs::remove_file(&marker).with_context(|| "remove the transaction marker".to_string())?;
         let _ = fs::remove_dir_all(staging);
+        Ok(())
+    }
+
+    /// Run a verified package hook without a shell. The hook is executed
+    /// while the database transaction and package lock are still held, so a
+    /// non-zero exit or timeout rolls its package filesystem changes back.
+    fn run_postinstall(
+        manifest: &PackageManifest,
+        package_dir: &Path,
+        root: &Path,
+        profile: &PlatformProfile,
+        has_entware: bool,
+    ) -> Result<()> {
+        let Some((executable, arguments)) = manifest.postinstall.split_first() else {
+            return Ok(());
+        };
+        let executable = package_dir.join(executable);
+        let path = if has_entware {
+            "/opt/bin:/opt/sbin:/usr/sbin:/usr/bin:/sbin:/bin"
+        } else {
+            "/usr/sbin:/usr/bin:/sbin:/bin"
+        };
+        let mut child = Command::new(&executable)
+            .args(arguments)
+            .current_dir(package_dir)
+            .env_clear()
+            .env("PATH", path)
+            .env("YAM_ROOT", root)
+            .env("YAM_PKG", package_dir)
+            .env("YAM_ETC", &profile.paths.etc)
+            .env("YAM_VAR", &profile.paths.var)
+            .env("YAM_RUN", &profile.paths.run)
+            .env("YAM_PLATFORM", &profile.id)
+            .spawn()
+            .with_context(|| format!("start postinstall {}", executable.display()))?;
+        let timeout = std::time::Duration::from_secs(60);
+        let status = wait_timeout::ChildExt::wait_timeout(&mut child, timeout)?;
+        let status = match status {
+            Some(status) => status,
+            None => {
+                child.kill()?;
+                let _ = child.wait();
+                bail!("postinstall timed out after {} seconds", timeout.as_secs())
+            }
+        };
+        if !status.success() {
+            bail!("postinstall exited with {status}")
+        }
         Ok(())
     }
 

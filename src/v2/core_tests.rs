@@ -136,6 +136,7 @@ struct TestPackage {
     provides: Vec<String>,
     conflicts: Vec<String>,
     replaces: Vec<String>,
+    postinstall: Vec<String>,
 }
 impl TestPackage {
     fn new(name: &str, version: &str) -> Self {
@@ -147,6 +148,7 @@ impl TestPackage {
             provides: Vec::new(),
             conflicts: Vec::new(),
             replaces: Vec::new(),
+            postinstall: Vec::new(),
         }
     }
     fn file(mut self, path: &str, content: &[u8]) -> Self {
@@ -173,6 +175,11 @@ impl TestPackage {
         self.replaces.push(value.into());
         self
     }
+    #[allow(dead_code)]
+    fn postinstall(mut self, command: &[&str]) -> Self {
+        self.postinstall = command.iter().map(|value| (*value).into()).collect();
+        self
+    }
 
     /// Write the source tree under `source_dir` and pack it into `output`.
     fn pack(&self, source_dir: &Path, profile: &PlatformProfile, output: &Path) -> Result<()> {
@@ -182,7 +189,7 @@ impl TestPackage {
             files_entry += &format!("  {path}: {path}\n");
         }
         let yaml = format!(
-                "name: {}\nversion: {}\nlicense: MIT\ndescription: test package\ntargets: [any]\nfiles:\n{}depends: [{}]\nprovides: [{}]\nconflicts: [{}]\nreplaces: [{}]\n",
+                "name: {}\nversion: {}\nlicense: MIT\ndescription: test package\ntargets: [any]\nfiles:\n{}depends: [{}]\nprovides: [{}]\nconflicts: [{}]\nreplaces: [{}]\npostinstall: [{}]\n",
                 self.name,
                 self.version,
                 files_entry,
@@ -190,6 +197,7 @@ impl TestPackage {
                 self.provides.join(", "),
                 self.conflicts.join(", "),
                 self.replaces.join(", "),
+                self.postinstall.join(", "),
             );
         fs::write(source_dir.join("yam.yaml"), yaml)?;
         for (path, content) in &self.files {
@@ -230,6 +238,7 @@ fn manifest_for(
         permissions: Vec::new(),
         entware: None,
         services: BTreeMap::new(),
+        postinstall: Vec::new(),
         files_sha256: files
             .iter()
             .map(|(path, content)| (path.to_string(), digest_bytes(content)))
@@ -474,6 +483,64 @@ fn installing_a_package_that_declares_a_dependency_succeeds() {
     manager
         .install(&app_artifact, true)
         .expect("installing a package with a satisfied dependency must succeed");
+}
+
+#[test]
+fn postinstall_runs_with_the_documented_environment() {
+    let workdir = TempDir::new().unwrap();
+    let profile = test_profile(workdir.path());
+    let root = profile.paths.root.clone();
+    let artifact = workdir.path().join("hook.yampkg");
+    TestPackage::new("yam/hook", "1.0.0")
+        .file(
+            "bin/postinstall",
+            b"#!/bin/sh\nmkdir -p \"$YAM_VAR\"\nprintf '%s|%s|%s' \"$YAM_PLATFORM\" \"$YAM_ROOT\" \"$YAM_PKG\" > \"$YAM_VAR/postinstall-result\"\n",
+        )
+        .postinstall(&["bin/postinstall"])
+        .pack(&workdir.path().join("hook-src"), &profile, &artifact)
+        .unwrap();
+
+    let mut manager = Manager::open(root.clone(), profile.clone()).unwrap();
+    manager.install(&artifact, true).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(profile.paths.var.join("postinstall-result")).unwrap(),
+        format!(
+            "testplatform|{}|{}",
+            root.display(),
+            root.join("pkgs/yam/hook/1.0.0").display()
+        )
+    );
+}
+
+#[test]
+fn failed_postinstall_rolls_back_package_state() {
+    let workdir = TempDir::new().unwrap();
+    let profile = test_profile(workdir.path());
+    let root = profile.paths.root.clone();
+    let artifact = workdir.path().join("failing-hook.yampkg");
+    TestPackage::new("yam/failing-hook", "1.0.0")
+        .file("bin/postinstall", b"#!/bin/sh\nexit 23\n")
+        .file("bin/hook-tool", b"payload")
+        .postinstall(&["bin/postinstall"])
+        .pack(
+            &workdir.path().join("failing-hook-src"),
+            &profile,
+            &artifact,
+        )
+        .unwrap();
+
+    let mut manager = Manager::open(root.clone(), profile).unwrap();
+    let result = manager.install(&artifact, true);
+    assert!(
+        result.is_err(),
+        "a failing postinstall must fail installation"
+    );
+    assert!(result.unwrap_err().to_string().contains("postinstall"));
+    assert!(manager.list().unwrap().is_empty());
+    assert!(!root.join("bin/hook-tool").exists());
+    assert!(!root.join("pkgs/yam/failing-hook").exists());
+    assert!(!root.join("db/transaction.json").exists());
 }
 
 #[test]

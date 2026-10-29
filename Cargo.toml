@@ -1,6 +1,6 @@
 [package]
 name = "yam"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 
 [[bin]]
@@ -33,6 +33,7 @@ tar = "0.4"
 zstd = "0.13"
 semver = "1"
 fs4 = { version = "0.9", features = ["sync"] }
+wait-timeout = "0.2"
 
 [profile.release]
 # The manager is deployed to storage-constrained speakers.

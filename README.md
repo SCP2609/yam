@@ -87,12 +87,11 @@ curl -fsSL https://hackalice.me/install.sh | sh -s -- --uninstall
 ## Использование
 
 ```sh
-yam --platform yandexmicro list
-yam --platform yandexmicro search namespace/package
-yam --platform yandexmicro install namespace/package
-yam --platform yandexmicro doctor
-yam --platform yandexmicro repair
-yam --platform yandexmicro update
+yam registry add official https://repo.yse.wtf/v2 \
+  --key ed25519:5Rz8F47uftWVU5kLgWYhprkEZ4rpP2kecUge/a7KQas=
+
+yam registry list
+yam install yam/luna
 ```
 
 Реестр `official` по умолчанию не настроен: перед `search` и установкой по

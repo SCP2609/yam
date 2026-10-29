@@ -85,7 +85,7 @@ cargo build --release --target aarch64-unknown-linux-musl
 ## 3. Сначала проверьте архив локально
 
 ```sh
-./target/release/yam-publish pack --platform yandexmini_2 \
+./target/release/yam-publish pack \
   --profiles platforms \
   --source ../my-player \
   --output ../my-player/dist/player-yandexmini_2.yampkg
@@ -113,7 +113,6 @@ cargo build --release --target aarch64-unknown-linux-musl
 ```sh
 ./target/release/yam-publish release \
   --source ../my-player \
-  --platform yandexmini_2 \
   --profiles platforms \
   --output ../my-player/dist/player-yandexmini_2.yampkg \
   --token "$YAM_PUBLISH_TOKEN" \
