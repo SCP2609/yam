@@ -35,9 +35,10 @@ struct PackArgs {
     /// Directory containing yam.yaml.
     #[arg(long, default_value = ".")]
     source: PathBuf,
-    /// Platform ID from the profiles directory.
+    /// Platform ID from the profiles directory. Defaults to YAM_PLATFORM,
+    /// then to the sole concrete target in yam.yaml.
     #[arg(long, env = "YAM_PLATFORM")]
-    platform: String,
+    platform: Option<String>,
     /// Directory containing platform YAML profiles.
     #[arg(long, env = "YAM_PROFILES", default_value = "platforms")]
     profiles: PathBuf,
@@ -84,22 +85,26 @@ struct ReleaseArgs {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SourceManifest {
     name: String,
     version: String,
+    #[serde(default)]
+    targets: Vec<String>,
 }
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        CommandKind::Pack(args) => pack(&args),
+        CommandKind::Pack(args) => {
+            pack(&args)?;
+            Ok(())
+        }
         CommandKind::Publish(args) => publish(&args),
         CommandKind::Release(args) => {
-            pack(&args.pack)?;
+            let target = pack(&args.pack)?;
             publish(&PublishArgs {
                 artifact: args.pack.output.clone(),
                 source: args.pack.source,
-                target: args.pack.platform,
+                target,
                 upload_url: args.upload_url,
                 token: args.token,
                 key: args.key,
@@ -108,9 +113,38 @@ fn main() -> Result<()> {
     }
 }
 
-fn pack(args: &PackArgs) -> Result<()> {
-    let profile = PlatformProfile::load(&args.profiles, &args.platform)?;
-    Manager::pack(&args.source, &profile, &args.output)
+fn pack(args: &PackArgs) -> Result<String> {
+    let profile = resolve_platform(args)?;
+    Manager::pack(&args.source, &profile, &args.output)?;
+    Ok(profile.id)
+}
+
+fn resolve_platform(args: &PackArgs) -> Result<PlatformProfile> {
+    if let Some(platform) = &args.platform {
+        return PlatformProfile::load(&args.profiles, platform);
+    }
+    let manifest_path = args.source.join("yam.yaml");
+    let manifest: SourceManifest = serde_yaml::from_slice(
+        &fs::read(&manifest_path).with_context(|| format!("read {}", manifest_path.display()))?,
+    )?;
+    let mut targets: Vec<&str> = manifest
+        .targets
+        .iter()
+        .map(String::as_str)
+        .filter(|target| *target != "any")
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    match targets.as_slice() {
+        [platform] => PlatformProfile::load(&args.profiles, platform),
+        [] => bail!(
+            "cannot determine platform: yam.yaml only declares target any; pass --platform or set YAM_PLATFORM"
+        ),
+        _ => bail!(
+            "cannot determine platform: yam.yaml declares multiple targets ({}); pass --platform or set YAM_PLATFORM",
+            targets.join(", ")
+        ),
+    }
 }
 
 fn publish(args: &PublishArgs) -> Result<()> {
@@ -176,6 +210,7 @@ fn upload_message(name: &str, version: &str, target: &str, sha256: &str) -> Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn upload_signature_binds_all_artifact_identity_fields() {
@@ -183,5 +218,31 @@ mod tests {
             upload_message("author/package", "1.2.3", "yandexmini_2", "abc"),
             "yamreg-upload-v1\nauthor/package\n1.2.3\nyandexmini_2\nabc\n"
         );
+    }
+
+    #[test]
+    fn pack_platform_defaults_to_the_only_concrete_source_target() {
+        let workdir = TempDir::new().unwrap();
+        let source = workdir.path().join("source");
+        let profiles = workdir.path().join("profiles");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&profiles).unwrap();
+        fs::write(
+            source.join("yam.yaml"),
+            "name: test/package\nversion: 1.0.0\ntargets: [testplatform]\n",
+        )
+        .unwrap();
+        fs::write(
+            profiles.join("testplatform.yaml"),
+            "id: testplatform\narch: aarch64\ntriple: aarch64-unknown-linux-musl\npaths:\n  root: /tmp/yam-test\n  etc: /tmp/yam-etc\n  var: /tmp/yam-var\n  run: /tmp/yam-run\n",
+        )
+        .unwrap();
+        let args = PackArgs {
+            source,
+            platform: None,
+            profiles,
+            output: workdir.path().join("out.yampkg"),
+        };
+        assert_eq!(resolve_platform(&args).unwrap().id, "testplatform");
     }
 }

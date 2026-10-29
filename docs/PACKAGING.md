@@ -23,11 +23,15 @@ files:
 
 ```sh
 cargo build --release --target aarch64-unknown-linux-musl
-yam-publish --platform yandexmicro pack --source . --output hello.yampkg
+yam-publish pack --source . --output hello.yampkg
 ```
 
 `.yampkg` — архив `tar.zst`. YAM сам создаёт `MANIFEST.yaml` и хеши файлов.
 Не редактируйте архив вручную.
+
+`yam-publish` берёт платформу из `YAM_PLATFORM`, если она задана. Иначе он
+выбирает единственную конкретную платформу из `targets` в `yam.yaml`. Для
+`targets: [any]` или нескольких платформ укажите `--platform <id>`.
 
 Проверьте пакет в отдельном каталоге:
 
