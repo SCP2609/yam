@@ -2,17 +2,24 @@
 set -eu
 
 VERSION=${YAM_VERSION:-latest}
+PLATFORM=${YAM_PLATFORM:-}
 REMOVE_OLD=0
 UNINSTALL=0
 YES=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --platform|-p|-platform|-Platform)
+      [ "$#" -ge 2 ] || { echo "--platform требует значение." >&2; exit 2; }
+      PLATFORM=$2
+      shift
+      ;;
     --remove-old) REMOVE_OLD=1 ;;
     --uninstall) UNINSTALL=1 ;;
     --yes|-y) YES=1 ;;
     --help|-h)
-      echo 'Использование: install.sh [версия] [--remove-old]'
+      echo 'Использование: install.sh [версия] [--platform PLATFORM] [--remove-old]'
       echo '               install.sh --uninstall [--yes]'
+      echo '  --platform, -p  явно выбрать профиль станции (например yandexmini)'
       echo '  --remove-old  удалить legacy yamd из /data/quazar/yam'
       echo '  --uninstall   удалить YAM из $YAM_ROOT (по умолчанию /data/yam) вместе с пакетами и данными;'
       echo '                на yandexmicro также /usr/bin/yam и /etc/init.d/S99yam'
@@ -38,8 +45,6 @@ if [ "$root_ok" -eq 0 ]; then
   echo "Недопустимый YAM_ROOT: '${YAM_ROOT:-}'. Нужен абсолютный путь из символов A-Za-z0-9 . _ - без компонентов . и .., не /." >&2
   exit 2
 fi
-PLATFORM=${YAM_PLATFORM:-}
-
 if [ "$REMOVE_OLD" -eq 1 ] && [ "$DEVICE_ROOT" = /data/quazar/yam ]; then
   echo 'YAM_ROOT не может указывать на legacy-каталог при --remove-old.' >&2
   exit 2

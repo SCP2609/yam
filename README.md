@@ -39,7 +39,7 @@ irm https://raw.githubusercontent.com/nyakokitsu/yam/main/install.ps1 | iex
 необходимости её можно задать явно:
 
 ```sh
-curl -fsSL https://hackalice.me/install.sh | YAM_PLATFORM=yandexmini_2 sh
+curl -fsSL https://hackalice.me/install.sh | sh -s -- --platform yandexmini_2
 ```
 
 Параметры установщика:
@@ -47,7 +47,7 @@ curl -fsSL https://hackalice.me/install.sh | YAM_PLATFORM=yandexmini_2 sh
 | `install.sh` | `install.ps1` | Назначение |
 | --- | --- | --- |
 | аргумент `[версия]` или `YAM_VERSION` | `-Version` или `YAM_VERSION` | Релиз `yam-v<версия>`. По умолчанию `install.sh` берёт первый тег `yam-v*` из GitHub Releases без фильтра prerelease, `install.ps1` — первый не-draft и не-prerelease |
-| `YAM_PLATFORM` | `-Platform` или `YAM_PLATFORM` | Профиль платформы вместо автоопределения |
+| `--platform <id>`, `-p <id>` или `YAM_PLATFORM` | `-Platform` или `YAM_PLATFORM` | Профиль платформы вместо автоопределения |
 | `YAM_ROOT` | `YAM_ROOT` | Каталог YAM на колонке; по умолчанию `/data/yam`; абсолютный путь из символов `A-Za-z0-9 . _ -` |
 | `--remove-old` | `-RemoveOld` | Попытаться остановить legacy `yamd` и **полностью удалить** `/data/quazar/yam` |
 | `--uninstall` | `-Uninstall` | Удалить YAM из `YAM_ROOT` (по умолчанию `/data/yam`) вместе с пакетами, базой и данными; на Micro также `/usr/bin/yam` и `/etc/init.d/S99yam`. Перед удалением спрашивает подтверждение |

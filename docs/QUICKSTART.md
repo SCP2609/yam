@@ -34,7 +34,7 @@ yam --help
 профилем, например `yandexmini_2`:
 
 ```sh
-curl -fsSL https://hackalice.me/install.sh | YAM_PLATFORM=yandexmini_2 sh
+curl -fsSL https://hackalice.me/install.sh | sh -s -- --platform yandexmini_2
 ```
 
 Список profile ID: [PLATFORMS.md](PLATFORMS.md).
