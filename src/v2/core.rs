@@ -306,11 +306,17 @@ fn replace_link(path: &Path, target: &Path) -> Result<()> {
     fs::rename(temporary, path)?;
     Ok(())
 }
-pub(crate) fn set_payload_mode(path: &Path, payload_path: &str) -> Result<()> {
+pub(crate) fn set_payload_mode(path: &Path, payload_path: &str, archive_mode: u32) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = if payload_path.starts_with("bin/") || payload_path.starts_with("hooks/") {
+        // Preserve only the regular file's executable intent, never arbitrary
+        // archive permissions (setuid/setgid/sticky or group/world write).
+        // Keep the existing bin/hooks default for older authoring workflows.
+        let mode = if archive_mode & 0o111 != 0
+            || payload_path.starts_with("bin/")
+            || payload_path.starts_with("hooks/")
+        {
             0o755
         } else {
             0o644
